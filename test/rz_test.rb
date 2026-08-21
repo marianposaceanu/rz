@@ -302,6 +302,40 @@ class RzTest < Minitest::Test
     assert_equal 1, snapshot.fetch("terminals_count")
   end
 
+  def test_snapshot_records_the_amp_thread_on_its_terminal
+    rows = @rz.send(
+      :capture_ghostty,
+      capture_scrollback: false,
+      window_id: "window-current"
+    )
+    amp = {
+      "agent" => "amp",
+      "pid" => 400,
+      "tty" => "ttys016",
+      "cwd" => "/tmp/project",
+      "session_id" => "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    }
+    rows.first["agent_session"] = amp
+
+    snapshot = @rz.send(
+      :build_snapshot,
+      "backup",
+      "backup_20260720-120000",
+      "20260720-120000",
+      rows,
+      [amp],
+      [],
+      capture_scrollback: false,
+      target_window_id: "window-current"
+    )
+    terminal = snapshot.fetch("windows").first.fetch("tabs").first.fetch("terminals").first
+
+    assert_equal amp.fetch("session_id"), terminal.fetch("amp_thread_id")
+    refute terminal.key?("codex_session_id")
+    assert_equal [amp], snapshot.fetch("detected_amp_threads")
+    assert_empty snapshot.fetch("detected_codex_sessions")
+  end
+
   def test_save_output_lists_the_saved_tab_name
     output, = capture_io do
       @rz.send(
@@ -374,6 +408,110 @@ class RzTest < Minitest::Test
     assert_includes @rz.commands.last.last, "id of first window"
   end
 
+  def test_extracts_one_open_amp_thread_from_lsof_output
+    thread_id = "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    output = <<~TEXT
+      p19089
+      n/opt/homebrew/bin/amp
+      n/Users/marian/.cache/amp/logs/threads/#{thread_id}.log
+    TEXT
+
+    assert_equal thread_id, @rz.send(:amp_thread_id_from_lsof, output)
+
+    second_id = "T-01a0263b-7c89-7367-9e24-c78e3c0daedc"
+    ambiguous = output + "n/Users/marian/.cache/amp/logs/threads/#{second_id}.log\n"
+    assert_nil @rz.send(:amp_thread_id_from_lsof, ambiguous)
+  end
+
+  def test_process_discovery_only_inspects_supported_agents
+    thread_id = "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    ps_output = <<~TEXT
+          100     1 ??       /Applications/Ghostty.app/Contents/MacOS/ghostty
+          200   100 ttys016  /bin/zsh -l
+          300   200 ttys016  amp
+          400   200 ttys016  /usr/bin/sleep 60
+    TEXT
+    inspected_pids = []
+    rz = Rz.new([])
+    rz.define_singleton_method(:run_command) { |*| ps_output }
+    rz.define_singleton_method(:process_cwd) do |pid|
+      inspected_pids << pid
+      "/Users/marian/dot-files"
+    end
+    rz.define_singleton_method(:open_amp_thread_id) { |_| thread_id }
+
+    sessions = rz.send(:running_agent_sessions)
+
+    assert_equal [300], inspected_pids
+    assert_equal 1, sessions.length
+    assert_equal "amp", sessions.first.fetch("agent")
+    assert_equal thread_id, sessions.first.fetch("session_id")
+  end
+
+  def test_matches_amp_and_codex_to_their_own_terminals
+    cwd = "/Users/marian/dot-files"
+    rows = [
+      {
+        "terminal_id" => "terminal-amp",
+        "terminal_name" => "⣒ macOS display detection - amp - ~/dot-files",
+        "working_directory" => cwd
+      },
+      {
+        "terminal_id" => "terminal-codex",
+        "terminal_name" => "codex | dot-files",
+        "working_directory" => cwd
+      }
+    ]
+    codex = {
+      "agent" => "codex",
+      "pid" => 300,
+      "tty" => "ttys004",
+      "cwd" => cwd,
+      "session_id" => "019f7eb7-dc72-75b3-b042-91599cdd90ac"
+    }
+    amp = {
+      "agent" => "amp",
+      "pid" => 400,
+      "tty" => "ttys016",
+      "cwd" => cwd,
+      "session_id" => "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    }
+
+    assignments, warnings = @rz.send(:assign_agent_sessions, rows, [codex, amp])
+
+    assert_equal amp, assignments.fetch("terminal-amp")
+    assert_equal codex, assignments.fetch("terminal-codex")
+    assert_empty warnings
+  end
+
+  def test_does_not_cross_match_agents_with_unidentified_titles_in_the_same_directory
+    cwd = "/Users/marian/dot-files"
+    rows = [
+      {"terminal_id" => "terminal-1", "terminal_name" => "shell one", "working_directory" => cwd},
+      {"terminal_id" => "terminal-2", "terminal_name" => "shell two", "working_directory" => cwd}
+    ]
+    codex = {
+      "agent" => "codex",
+      "pid" => 300,
+      "tty" => "ttys004",
+      "cwd" => cwd,
+      "session_id" => "019f7eb7-dc72-75b3-b042-91599cdd90ac"
+    }
+    amp = {
+      "agent" => "amp",
+      "pid" => 400,
+      "tty" => "ttys016",
+      "cwd" => cwd,
+      "session_id" => "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    }
+
+    assignments, warnings = @rz.send(:assign_agent_sessions, rows, [codex, amp])
+
+    assert_empty assignments
+    assert_equal 2, warnings.length
+    assert(warnings.all? { |warning| warning.include?("multiple agent types share this directory") })
+  end
+
   def test_assigns_a_session_by_unique_project_title_when_ghostty_cwd_is_blank
     rows = [
       {
@@ -383,13 +521,14 @@ class RzTest < Minitest::Test
       }
     ]
     session = {
+      "agent" => "codex",
       "pid" => 18_717,
       "tty" => "ttys002",
       "cwd" => "/Users/marian/work/fws-docs",
       "session_id" => "019f7eb7-dc72-75b3-b042-91599cdd90ac"
     }
 
-    assignments, warnings = @rz.send(:assign_codex_sessions, rows, [session])
+    assignments, warnings = @rz.send(:assign_agent_sessions, rows, [session])
 
     assert_equal session, assignments.fetch("terminal-fws-docs")
     assert_empty warnings
@@ -409,13 +548,14 @@ class RzTest < Minitest::Test
       }
     ]
     session = {
+      "agent" => "codex",
       "pid" => 18_717,
       "tty" => "ttys002",
       "cwd" => "/Users/marian/work/fws-docs",
       "session_id" => "019f7eb7-dc72-75b3-b042-91599cdd90ac"
     }
 
-    assignments, warnings = @rz.send(:assign_codex_sessions, rows, [session])
+    assignments, warnings = @rz.send(:assign_agent_sessions, rows, [session])
 
     assert_empty assignments
     assert_equal 1, warnings.length
@@ -426,6 +566,7 @@ class RzTest < Minitest::Test
 
   def test_window_scoped_matching_does_not_warn_about_unrelated_sessions
     session = {
+      "agent" => "codex",
       "pid" => 18_927,
       "tty" => "ttys006",
       "cwd" => "/Users/marian/work/playground/ark-mp-com",
@@ -433,7 +574,7 @@ class RzTest < Minitest::Test
     }
 
     assignments, warnings = @rz.send(
-      :assign_codex_sessions,
+      :assign_agent_sessions,
       [],
       [session],
       warn_for_all_sessions: false
@@ -474,13 +615,14 @@ class RzTest < Minitest::Test
       }
     ]
     session = {
+      "agent" => "codex",
       "pid" => 18_927,
       "tty" => "ttys006",
       "cwd" => "/Users/marian/work/playground/ark-mp-com",
       "session_id" => "019f7a33-7f86-7450-ac59-4dde828fa26d"
     }
 
-    assignments, warnings = @rz.send(:assign_codex_sessions, rows, [session])
+    assignments, warnings = @rz.send(:assign_agent_sessions, rows, [session])
 
     assert_equal session, assignments.fetch("terminal-cronos")
     assert_empty warnings
@@ -525,6 +667,28 @@ class RzTest < Minitest::Test
     assert_includes shell_command, "kitty-shell-cwd://%s%s"
     assert_includes shell_command, terminal.fetch("working_directory")
     assert_includes shell_command, "exec codex resume"
+  end
+
+  def test_restore_continues_the_saved_amp_thread
+    thread_id = "T-01a023e2-3f9d-7705-98ed-4ea63108e87e"
+    terminal = {
+      "working_directory" => "/Users/marian/dot-files",
+      "amp_thread_id" => thread_id
+    }
+    duplicates = []
+
+    command = @rz.send(:restore_command, terminal, @state_dir, [], duplicates)
+    shell_command = Shellwords.split(command).last
+
+    assert_includes shell_command, "exec amp threads continue #{thread_id}"
+    assert_empty duplicates
+
+    command = @rz.send(:restore_command, terminal, @state_dir, [["amp", thread_id]], duplicates)
+    shell_command = Shellwords.split(command).last
+
+    assert_includes shell_command, "Amp thread already running"
+    refute_includes shell_command, "exec amp threads continue"
+    assert_equal [{"agent" => "amp", "session_id" => thread_id}], duplicates
   end
 
   def test_restore_applescript_closes_only_windows_present_before_restore

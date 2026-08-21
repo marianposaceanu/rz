@@ -21,6 +21,7 @@ class Rz
   DEFAULT_CLEAN_AGE = 7 * 24 * 60 * 60
   MINIMUM_WATCH_INTERVAL = 10
   UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+  AMP_THREAD_PATTERN = /T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
 
   def initialize(argv)
     @argv = argv.dup
@@ -229,8 +230,8 @@ class Rz
       end
       raise "Ghostty has no restorable terminal surfaces" if rows.empty?
 
-      process_sessions = running_codex_sessions
-      assignments, warnings = assign_codex_sessions(
+      process_sessions = running_agent_sessions
+      assignments, warnings = assign_agent_sessions(
         rows,
         process_sessions,
         warn_for_all_sessions: target_window_id.nil?
@@ -240,7 +241,7 @@ class Rz
       end
       assignments.each do |terminal_id, session|
         row = terminal_row(rows, terminal_id)
-        row["codex"] = session
+        row["agent_session"] = session
         row["working_directory"] = session.fetch("cwd") if row["working_directory"].to_s.empty?
       end
 
@@ -275,7 +276,15 @@ class Rz
         labeled("SCOPE", target_window_id ? "Ghostty window #{target_window_id}" : "all Ghostty windows"),
         labeled("LAYOUT", layout_summary(snapshot)),
         *saved_tab_lines(snapshot),
-        labeled("CONTENT", content_summary(assignments.length, rows.count { |row| row["scrollback_file"] }, capture_scrollback: capture_scrollback)),
+        labeled(
+          "CONTENT",
+          content_summary(
+            assignments.values.count { |session| session.fetch("agent") == "codex" },
+            assignments.values.count { |session| session.fetch("agent") == "amp" },
+            rows.count { |row| row["scrollback_file"] },
+            capture_scrollback: capture_scrollback
+          )
+        ),
         labeled("LOCATION", final_dir)
       ]
       warnings.each { |warning| lines << labeled("WARNING", warning) }
@@ -297,15 +306,15 @@ class Rz
     end
 
     ready_file = close_existing ? "/tmp/ghostty-rz-#{Process.pid}-#{SecureRandom.hex(6)}.ready" : nil
-    running_ids = if close_existing
+    running_sessions = if close_existing
       []
     else
-      running_codex_sessions.filter_map { |session| session["session_id"] }.uniq
+      running_agent_sessions.map { |session| session_key(session) }.uniq
     end
-    script, duplicate_ids = restore_applescript(
+    script, duplicate_sessions = restore_applescript(
       snapshot,
       snapshot_dir,
-      running_ids,
+      running_sessions,
       close_existing: close_existing,
       ready_file: ready_file
     )
@@ -320,8 +329,11 @@ class Rz
       labeled("LAYOUT", layout_summary(snapshot)),
       labeled("STATUS", restore_status(close_existing))
     ]
-    duplicate_ids.each do |id|
-      lines << labeled("WARNING", "Codex session already running; opened a shell: #{id}")
+    duplicate_sessions.each do |session|
+      lines << labeled(
+        "WARNING",
+        "#{agent_label(session)} #{agent_unit(session)} already running; opened a shell: #{session.fetch("session_id")}"
+      )
     end
     lines << labeled("GHOSTTY", output) unless output.empty?
     print_box("WORKSPACE RESTORED", lines)
@@ -361,6 +373,7 @@ class Rz
     validate_snapshot!(snapshot)
     terminals = snapshot.fetch("windows").flat_map { |window| window.fetch("tabs") }.flat_map { |tab| tab.fetch("terminals") }
     codex_count = terminals.count { |terminal| terminal["codex_session_id"] }
+    amp_count = terminals.count { |terminal| terminal["amp_thread_id"] }
     scrollback_count = terminals.count { |terminal| terminal["scrollback_file"] }
     scope = snapshot.fetch("scope")
     scope_summary = scope.fetch("type") == "window" ? "Ghostty window #{scope.fetch("window_id")}" : "all Ghostty windows"
@@ -372,7 +385,7 @@ class Rz
       labeled("LAYOUT", layout_summary(snapshot)),
       labeled(
         "CONTENT",
-        content_summary(codex_count, scrollback_count, capture_scrollback: snapshot.fetch("scrollback_captured"))
+        content_summary(codex_count, amp_count, scrollback_count, capture_scrollback: snapshot.fetch("scrollback_captured"))
       ),
       ""
     ]
@@ -405,6 +418,7 @@ class Rz
           lines << labeled("TERM", terminal_summary)
           lines << labeled("CWD", terminal["working_directory"]) unless terminal["working_directory"].to_s.empty?
           lines << labeled("CODEX", terminal["codex_session_id"]) if terminal["codex_session_id"]
+          lines << labeled("AMP", terminal["amp_thread_id"]) if terminal["amp_thread_id"]
         end
       end
     end
@@ -770,7 +784,7 @@ class Rz
     end
   end
 
-  def running_codex_sessions
+  def running_agent_sessions
     output = run_command("ps", "-axo", "pid=,ppid=,tty=,command=")
     processes = output.lines.filter_map do |line|
       line = line.chomp
@@ -794,16 +808,28 @@ class Rz
       pid = process.fetch("pid")
       tty = process.fetch("tty")
       command = process.fetch("command")
-      next unless command.include?("/bin/codex")
-      next if command.include?("codex-code-mode-host")
-      next if command.start_with?("node ")
+
+      agent = if codex_process?(command)
+        "codex"
+      elsif amp_process?(command)
+        "amp"
+      else
+        next
+      end
       next if ghostty_pids.any? && !descendant_of?(process, ghostty_pids, process_by_pid)
 
       cwd = process_cwd(pid)
-      session_id = command[/\bresume\s+(#{UUID_PATTERN})/, 1] || newest_open_session_id(pid)
-      next unless cwd && session_id
+      next unless cwd
+
+      if agent == "codex"
+        session_id = command[/\bresume\s+(#{UUID_PATTERN})/, 1] || newest_open_session_id(pid)
+      else
+        session_id = command[AMP_THREAD_PATTERN] || open_amp_thread_id(pid)
+      end
+      next unless session_id
 
       {
+        "agent" => agent,
         "pid" => pid,
         "tty" => tty,
         "cwd" => cwd,
@@ -811,6 +837,16 @@ class Rz
         "command" => command
       }
     end
+  end
+
+  def codex_process?(command)
+    command.include?("/bin/codex") &&
+      !command.include?("codex-code-mode-host") &&
+      !command.start_with?("node ")
+  end
+
+  def amp_process?(command)
+    File.basename(command.split(/\s+/, 2).first.to_s) == "amp"
   end
 
   def ghostty_process?(command)
@@ -855,85 +891,122 @@ class Rz
     path && File.basename(path)[UUID_PATTERN]
   end
 
-  def assign_codex_sessions(rows, sessions, warn_for_all_sessions: true)
+  def open_amp_thread_id(pid)
+    output, status = Open3.capture2e("lsof", "-nP", "-p", pid.to_s, "-Fn")
+    return unless status.success?
+
+    amp_thread_id_from_lsof(output)
+  end
+
+  def amp_thread_id_from_lsof(output)
+    ids = output.lines.filter_map do |line|
+      next unless line.include?("/.cache/amp/logs/threads/") && line.rstrip.end_with?(".log")
+
+      line[AMP_THREAD_PATTERN]
+    end.uniq
+    ids.one? ? ids.first : nil
+  end
+
+  def assign_agent_sessions(rows, sessions, warn_for_all_sessions: true)
     assignments = {}
     warnings = []
-    unassigned = {}
+    remaining = sessions.dup
 
-    sessions.group_by { |session| session["cwd"] }.each do |cwd, cwd_sessions|
-      cwd_rows = rows.select { |row| row["working_directory"] == cwd }
-      candidates = cwd_rows.select { |row| codex_title?(row["terminal_name"], cwd) }
-      candidates += (cwd_rows - candidates) if candidates.length < cwd_sessions.length
-      candidates = candidates.first(cwd_sessions.length)
+    ordered_sessions = sessions.sort_by do |session|
+      [session.fetch("agent") == "amp" ? 0 : 1, tty_number(session.fetch("tty"))]
+    end
+    ordered_sessions.group_by { |session| [session.fetch("agent"), session.fetch("cwd")] }.each_value do |agent_sessions|
+      cwd = agent_sessions.first.fetch("cwd")
+      agent = agent_sessions.first.fetch("agent")
+      candidates = rows.reject { |row| assignments.key?(row.fetch("terminal_id")) }.select do |row|
+        row["working_directory"] == cwd && agent_title?(row["terminal_name"], cwd, agent)
+      end
+
+      agent_sessions.zip(candidates).each do |session, row|
+        next unless row
+
+        assignments[row.fetch("terminal_id")] = session
+        remaining.delete(session)
+      end
+    end
+
+    remaining.group_by { |session| session.fetch("cwd") }.each do |cwd, cwd_sessions|
+      candidates = rows.reject { |row| assignments.key?(row.fetch("terminal_id")) }.select do |row|
+        row["working_directory"] == cwd
+      end
+      next if cwd_sessions.map { |session| session.fetch("agent") }.uniq.length > 1
 
       sorted_sessions = cwd_sessions.sort_by { |session| tty_number(session["tty"]) }
-      candidates.zip(sorted_sessions).each do |row, session|
-        next unless row && session
+      sorted_sessions.zip(candidates).each do |session, row|
+        next unless row
 
-        assignments[row["terminal_id"]] = session
+        assignments[row.fetch("terminal_id")] = session
+        remaining.delete(session)
       end
-
-      unassigned[cwd] = sorted_sessions.drop(candidates.length)
     end
 
-    unassigned.each do |cwd, cwd_sessions|
-      next if cwd_sessions.empty?
+    remaining.group_by { |session| [session.fetch("agent"), session.fetch("cwd")] }.each_value do |agent_sessions|
+      next unless agent_sessions.one?
 
+      session = agent_sessions.first
+      cwd = session.fetch("cwd")
       available_rows = rows.reject { |row| assignments.key?(row["terminal_id"]) }
       title_candidates = available_rows.select do |row|
-        row["working_directory"].to_s.empty? && title_matches_cwd?(row["terminal_name"], cwd)
+        row["working_directory"].to_s.empty? &&
+          title_matches_cwd?(row["terminal_name"], cwd, session.fetch("agent"))
       end
 
-      if cwd_sessions.one? && title_candidates.one?
-        assignments[title_candidates.first.fetch("terminal_id")] = cwd_sessions.first
-        unassigned[cwd] = []
-      end
-    end
-
-    remaining_sessions = unassigned.values.flatten
-    historical_names = historical_terminal_names(remaining_sessions.map { |session| session.fetch("session_id") })
-    unassigned.each do |cwd, cwd_sessions|
-      unassigned[cwd] = cwd_sessions.reject do |session|
-        previous_name = historical_names[session.fetch("session_id")]
-        next false if previous_name.to_s.empty?
-
-        available_rows = rows.reject { |row| assignments.key?(row["terminal_id"]) }
-        historical_candidates = available_rows.select do |row|
-          row["working_directory"].to_s.empty? &&
-            stable_terminal_title(row["terminal_name"]) == stable_terminal_title(previous_name)
-        end
-        next false unless historical_candidates.one?
-
-        assignments[historical_candidates.first.fetch("terminal_id")] = session
-        true
+      if title_candidates.one?
+        assignments[title_candidates.first.fetch("terminal_id")] = session
+        remaining.delete(session)
       end
     end
 
-    unassigned.each do |cwd, cwd_sessions|
-      next if cwd_sessions.empty?
+    historical_names = historical_terminal_names(remaining)
+    remaining.dup.each do |session|
+      previous_name = historical_names[session_key(session)]
+      next if previous_name.to_s.empty?
 
       available_rows = rows.reject { |row| assignments.key?(row["terminal_id"]) }
+      historical_candidates = available_rows.select do |row|
+        row["working_directory"].to_s.empty? &&
+          stable_terminal_title(row["terminal_name"]) == stable_terminal_title(previous_name)
+      end
+      next unless historical_candidates.one?
+
+      assignments[historical_candidates.first.fetch("terminal_id")] = session
+      remaining.delete(session)
+    end
+
+    remaining.each do |session|
+      cwd = session.fetch("cwd")
+      available_rows = rows.reject { |row| assignments.key?(row["terminal_id"]) }
       title_candidates = available_rows.select do |row|
-        row["working_directory"].to_s.empty? && title_matches_cwd?(row["terminal_name"], cwd)
+        row["working_directory"].to_s.empty? &&
+          title_matches_cwd?(row["terminal_name"], cwd, session.fetch("agent"))
       end
 
       next unless warn_for_all_sessions || title_candidates.any?
 
-      reason = if title_candidates.length > 1
+      exact_cwd_candidates = available_rows.select { |row| row["working_directory"] == cwd }
+      ambiguous_agents = remaining.any? do |other|
+        other != session && other.fetch("cwd") == cwd && other.fetch("agent") != session.fetch("agent")
+      end
+      reason = if ambiguous_agents && exact_cwd_candidates.any?
+        "multiple agent types share this directory and terminal titles do not identify them"
+      elsif title_candidates.length > 1
         "multiple blank-directory Ghostty terminals have matching project titles"
       else
         "Ghostty exposed no terminal with that directory, a unique matching project title, or a unique prior session title"
       end
-      cwd_sessions.each do |session|
-        warnings << "Codex session #{session.fetch("session_id")} on #{session.fetch("tty")} in #{cwd} was not matched: #{reason}; it will not auto-resume"
-      end
+      warnings << "#{agent_label(session)} #{agent_unit(session)} #{session.fetch("session_id")} on #{session.fetch("tty")} in #{cwd} was not matched: #{reason}; it will not auto-resume"
     end
 
     [assignments, warnings]
   end
 
-  def historical_terminal_names(session_ids)
-    wanted = session_ids.to_h { |session_id| [session_id, true] }
+  def historical_terminal_names(sessions)
+    wanted = sessions.to_h { |session| [session_key(session), true] }
     names = {}
     return names if wanted.empty? || !Dir.exist?(@snapshots_dir)
 
@@ -947,14 +1020,15 @@ class Rz
       snapshot.fetch("windows", []).each do |window|
         window.fetch("tabs", []).each do |tab|
           tab.fetch("terminals", []).each do |terminal|
-            session_id = terminal["codex_session_id"]
-            next unless wanted.key?(session_id)
+            session = terminal_session(terminal)
+            key = session && session_key(session)
+            next unless wanted.key?(key)
 
             name = terminal["name"].to_s
             next if name.empty?
 
-            names[session_id] = name
-            wanted.delete(session_id)
+            names[key] = name
+            wanted.delete(key)
           end
         end
       end
@@ -970,7 +1044,7 @@ class Rz
     title.to_s.strip.sub(/\A[\u2800-\u28ff]\s*/, "")
   end
 
-  def title_matches_cwd?(title, cwd)
+  def title_matches_cwd?(title, cwd, agent)
     basename = File.basename(cwd)
     title = title.to_s.strip
     first = title.each_codepoint.first
@@ -978,18 +1052,38 @@ class Rz
     title == basename ||
       title.end_with?("| #{basename}") ||
       (first && first.between?(0x2800, 0x28ff) && title.end_with?(" #{basename}")) ||
-      (title.downcase.include?("codex") && title.include?(basename)) ||
+      (agent == "codex" && title.downcase.include?("codex") && title.include?(basename)) ||
+      (agent == "amp" && amp_title?(title) && title.include?(basename)) ||
       (title.include?("Action Required") && title.include?(basename))
   end
 
-  def codex_title?(title, cwd)
+  def agent_title?(title, cwd, agent)
+    return amp_title?(title) if agent == "amp"
+
     basename = File.basename(cwd)
     first = title.each_codepoint.first
     title.include?("Action Required") ||
       title.downcase.include?("codex") ||
       title == basename ||
       title.end_with?("| #{basename}") ||
-      (first && first.between?(0x2800, 0x28ff))
+      (first && first.between?(0x2800, 0x28ff) && !amp_title?(title))
+  end
+
+  def amp_title?(title)
+    normalized = title.to_s.downcase.strip
+    normalized == "amp" || normalized.include?(" - amp - ") || normalized.end_with?(" - amp")
+  end
+
+  def session_key(session)
+    [session.fetch("agent"), session.fetch("session_id")]
+  end
+
+  def agent_label(session)
+    session.fetch("agent") == "amp" ? "Amp" : "Codex"
+  end
+
+  def agent_unit(session)
+    session.fetch("agent") == "amp" ? "thread" : "session"
   end
 
   def tty_number(tty)
@@ -1011,15 +1105,20 @@ class Rz
           "name" => first_tab_row["tab_name"],
           "selected" => first_tab_row["tab_selected"],
           "terminals" => tab_rows.sort_by { |row| row["terminal_index"] }.map do |row|
-            {
+            terminal = {
               "index" => row["terminal_index"],
               "id" => row["terminal_id"],
               "name" => row["terminal_name"],
               "focused" => row["terminal_focused"],
               "working_directory" => row["working_directory"],
-              "scrollback_file" => row["scrollback_file"],
-              "codex_session_id" => row.dig("codex", "session_id")
+              "scrollback_file" => row["scrollback_file"]
             }.compact
+            session = row["agent_session"]
+            if session
+              key = session.fetch("agent") == "amp" ? "amp_thread_id" : "codex_session_id"
+              terminal[key] = session.fetch("session_id")
+            end
+            terminal
           end
         }
       end
@@ -1046,14 +1145,15 @@ class Rz
       "scrollback_captured" => capture_scrollback,
       "scope" => target_window_id ? {"type" => "window", "window_id" => target_window_id} : {"type" => "all_windows"},
       "windows" => windows,
-      "detected_codex_sessions" => process_sessions,
+      "detected_codex_sessions" => process_sessions.select { |session| session.fetch("agent") == "codex" },
+      "detected_amp_threads" => process_sessions.select { |session| session.fetch("agent") == "amp" },
       "warnings" => warnings,
       "limitations" => [
         "Ghostty does not expose split geometry; terminal counts restore as right-hand splits.",
         capture_scrollback ?
           "Scrollback restores as plain text output, without original styling or interactive state." :
           "Scrollback was intentionally skipped for this fast snapshot.",
-        "Only Codex conversations are resumed; arbitrary child processes are not reconstructible."
+        "Only Codex conversations and Amp threads are resumed; arbitrary child processes are not reconstructible."
       ]
     }
   end
@@ -1113,17 +1213,21 @@ class Rz
   end
 
   def print_restore_preview(snapshot, snapshot_dir, close_existing:)
-    ids = snapshot.fetch("windows").flat_map { |window| window.fetch("tabs") }.flat_map { |tab| tab.fetch("terminals") }.filter_map { |terminal| terminal["codex_session_id"] }
+    sessions = snapshot.fetch("windows").flat_map { |window| window.fetch("tabs") }.flat_map { |tab| tab.fetch("terminals") }.filter_map { |terminal| terminal_session(terminal) }
+    codex_ids = sessions.filter_map { |session| session["session_id"] if session.fetch("agent") == "codex" }
+    amp_ids = sessions.filter_map { |session| session["session_id"] if session.fetch("agent") == "amp" }
     lines = [
       labeled("STATUS", "Dry run - Ghostty will not be changed"),
       labeled("SNAPSHOT", snapshot.fetch("id")),
       labeled("SAVED", "#{display_time(snapshot.fetch("saved_at"))}  |  Ghostty #{snapshot.fetch("ghostty_version")}"),
       labeled("LAYOUT", layout_summary(snapshot)),
       labeled("WINDOWS", close_existing ? "Existing Ghostty windows will close after restore" : "Existing Ghostty windows will remain open"),
-      labeled("CODEX", ids.empty? ? "none" : "#{ids.length} session(s)"),
+      labeled("CODEX", codex_ids.empty? ? "none" : "#{codex_ids.length} session(s)"),
+      *codex_ids.map { |id| "              #{id}" },
+      labeled("AMP", amp_ids.empty? ? "none" : "#{amp_ids.length} thread(s)"),
+      *amp_ids.map { |id| "              #{id}" },
       labeled("LOCATION", snapshot_dir)
     ]
-    ids.each { |id| lines << "              #{id}" }
     snapshot.fetch("limitations", []).each { |limitation| lines << labeled("NOTE", limitation) }
     print_box("RESTORE PREVIEW", lines)
   end
@@ -1142,9 +1246,9 @@ class Rz
     end
   end
 
-  def content_summary(codex_count, scrollback_count, capture_scrollback:)
+  def content_summary(codex_count, amp_count, scrollback_count, capture_scrollback:)
     scrollback = capture_scrollback ? "#{scrollback_count} scrollback file(s)" : "scrollback skipped"
-    "#{codex_count} Codex session(s)  |  #{scrollback}"
+    "#{codex_count} Codex session(s)  |  #{amp_count} Amp thread(s)  |  #{scrollback}"
   end
 
   def restore_status(close_existing)
@@ -1241,7 +1345,7 @@ class Rz
     end
   end
 
-  def restore_applescript(snapshot, snapshot_dir, running_ids, close_existing:, ready_file: nil)
+  def restore_applescript(snapshot, snapshot_dir, running_sessions, close_existing:, ready_file: nil)
     lines = ['tell application "Ghostty"', "activate"]
     lines << "set rzExistingWindowIds to id of every window" if close_existing
     duplicates = []
@@ -1263,7 +1367,7 @@ class Rz
           first_config,
           terminals.first,
           snapshot_dir,
-          running_ids,
+          running_sessions,
           duplicates,
           ready_file: ready_file
         )
@@ -1288,7 +1392,7 @@ class Rz
             config_var,
             terminal,
             snapshot_dir,
-            running_ids,
+            running_sessions,
             duplicates,
             ready_file: ready_file
           )
@@ -1358,16 +1462,16 @@ class Rz
     row.values_at("window_x", "window_y", "window_width", "window_height").all?
   end
 
-  def append_configuration(lines, variable, terminal, snapshot_dir, running_ids, duplicates, ready_file: nil)
+  def append_configuration(lines, variable, terminal, snapshot_dir, running_sessions, duplicates, ready_file: nil)
     lines << "set #{variable} to new surface configuration"
     cwd = terminal["working_directory"].to_s
     cwd = @home if cwd.empty?
     lines << "set initial working directory of #{variable} to #{applescript_string(cwd)}"
-    lines << "set command of #{variable} to #{applescript_string(restore_command(terminal, snapshot_dir, running_ids, duplicates, cwd: cwd, ready_file: ready_file))}"
+    lines << "set command of #{variable} to #{applescript_string(restore_command(terminal, snapshot_dir, running_sessions, duplicates, cwd: cwd, ready_file: ready_file))}"
     lines << "set wait after command of #{variable} to true"
   end
 
-  def restore_command(terminal, snapshot_dir, running_ids, duplicates, cwd: nil, ready_file: nil)
+  def restore_command(terminal, snapshot_dir, running_sessions, duplicates, cwd: nil, ready_file: nil)
     cwd = terminal["working_directory"].to_s if cwd.nil?
     cwd = @home if cwd.empty?
     commands = [working_directory_report_command(cwd)]
@@ -1377,18 +1481,31 @@ class Rz
     scrollback = terminal["scrollback_file"] && File.join(snapshot_dir, terminal["scrollback_file"])
     commands << "/bin/cat -- #{Shellwords.escape(scrollback)}" if scrollback && File.file?(scrollback)
 
-    session_id = terminal["codex_session_id"]
-    if session_id && !running_ids.include?(session_id)
-      commands << "exec codex resume #{Shellwords.escape(session_id)}"
+    session = terminal_session(terminal)
+    if session && !running_sessions.include?(session_key(session))
+      session_id = session.fetch("session_id")
+      if session.fetch("agent") == "amp"
+        commands << "exec amp threads continue #{Shellwords.escape(session_id)}"
+      else
+        commands << "exec codex resume #{Shellwords.escape(session_id)}"
+      end
     else
-      if session_id
-        duplicates << session_id
-        commands << "/usr/bin/printf '\\n[rz] Codex session already running: %s\\n' #{Shellwords.escape(session_id)}"
+      if session
+        duplicates << session
+        commands << "/usr/bin/printf '\\n[rz] #{agent_label(session)} #{agent_unit(session)} already running: %s\\n' #{Shellwords.escape(session.fetch("session_id"))}"
       end
       commands << "exec /bin/zsh -l"
     end
 
     "/bin/zsh -lc #{Shellwords.escape(commands.join("; "))}"
+  end
+
+  def terminal_session(terminal)
+    if terminal["codex_session_id"]
+      {"agent" => "codex", "session_id" => terminal.fetch("codex_session_id")}
+    elsif terminal["amp_thread_id"]
+      {"agent" => "amp", "session_id" => terminal.fetch("amp_thread_id")}
+    end
   end
 
   def working_directory_report_command(cwd)

@@ -2,7 +2,8 @@
 
 `rz` saves and restores native [Ghostty](https://ghostty.org/) workspaces on
 macOS. A snapshot records windows, tabs, terminal surfaces, working directories,
-focus, window geometry, non-empty scrollback, and Codex conversation IDs.
+focus, window geometry, non-empty scrollback, Codex conversation IDs, and Amp
+thread IDs.
 
 Restoring creates the complete replacement workspace before closing the old
 Ghostty windows. Use `--keep-existing` when you want an additive restore instead.
@@ -56,12 +57,18 @@ window by default; pass `--all-windows` to save the complete app.
 Snapshots and watcher state live under
 `~/.local/state/ghostty-rz`. Override that location with `RZ_STATE_DIR`.
 
+When a terminal is running Codex or [Amp](https://ampcode.com/), `rz` associates
+the process with that exact Ghostty terminal. Restore uses `codex resume` for a
+Codex conversation and `amp threads continue` for an Amp thread. If the same
+conversation or thread is still running during an additive restore, `rz` opens a
+plain shell instead of starting a duplicate.
+
 ## Limits
 
 Ghostty exposes terminal surfaces but not its split tree or pane proportions, so
 additional surfaces restore as right-hand splits. Scrollback is replayed as text,
-not as a running process. `rz` can resume detected Codex conversations by their
-exact IDs, but it cannot reconstruct arbitrary programs.
+not as a running process. `rz` can resume detected Codex conversations and Amp
+threads by their exact IDs, but it cannot reconstruct arbitrary programs.
 
 ## Development
 

@@ -5,6 +5,9 @@ macOS. A snapshot records windows, tabs, terminal surfaces, working directories,
 focus, window geometry, non-empty scrollback, Codex conversation IDs, and Amp
 thread IDs.
 
+`rz` is a small native executable written in Rust. Snapshots created by the
+earlier Ruby releases remain fully compatible.
+
 Restoring creates the complete replacement workspace before closing the old
 Ghostty windows. Use `--keep-existing` when you want an additive restore instead.
 
@@ -15,8 +18,8 @@ brew tap marianposaceanu/tap
 brew install rz
 ```
 
-`rz` requires macOS, Ruby 2.7 or newer, and a recent Ghostty release with its
-AppleScript API enabled:
+`rz` requires macOS and a recent Ghostty release with its AppleScript API
+enabled:
 
 ```ini
 macos-applescript = true
@@ -41,6 +44,7 @@ rz --list                       # list snapshots
 rz --list 3                     # inspect snapshot number 3
 rz --clean                      # remove snapshots older than seven days
 rz --clean 30d                  # choose another maximum age
+rz --version                    # print the installed version
 ```
 
 Start a shell-scoped automatic snapshot watcher with:
@@ -72,11 +76,12 @@ threads by their exact IDs, but it cannot reconstruct arbitrary programs.
 
 ## Development
 
-The test suite uses only Ruby's standard library:
+Build and test from source with a recent Rust toolchain:
 
 ```sh
-ruby -c bin/rz
-ruby test/rz_test.rb
+cargo build --release
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## License

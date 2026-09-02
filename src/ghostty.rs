@@ -193,6 +193,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                                 scrollback_file: row.scrollback_file.clone(),
                                 codex_session_id: None,
                                 amp_thread_id: None,
+                                claude_session_id: None,
                             };
                             if let Some(session) = &row.agent_session {
                                 match session.agent {
@@ -201,6 +202,10 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                                     }
                                     Agent::Codex => {
                                         terminal.codex_session_id = Some(session.session_id.clone())
+                                    }
+                                    Agent::Claude => {
+                                        terminal.claude_session_id =
+                                            Some(session.session_id.clone())
                                     }
                                 }
                             }
@@ -245,6 +250,12 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         .filter(|session| session.agent == Agent::Amp)
         .cloned()
         .collect();
+    let detected_claude_sessions = input
+        .process_sessions
+        .iter()
+        .filter(|session| session.agent == Agent::Claude)
+        .cloned()
+        .collect();
     Snapshot {
         version: SNAPSHOT_VERSION,
         name: input.name.to_owned(),
@@ -264,6 +275,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         windows,
         detected_codex_sessions,
         detected_amp_threads,
+        detected_claude_sessions,
         warnings: input.warnings,
         limitations: vec![
             "Ghostty does not expose split geometry; terminal counts restore as right-hand splits."
@@ -274,7 +286,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
             } else {
                 "Scrollback was intentionally skipped for this fast snapshot.".into()
             },
-            "Only Codex conversations and Amp threads are resumed; arbitrary child processes are not reconstructible."
+            "Only Codex, Amp, and Claude sessions are resumed; arbitrary child processes are not reconstructible."
                 .into(),
         ],
     }
@@ -465,6 +477,9 @@ fn restore_command(
                 "exec amp threads continue {}",
                 shell_quote(session.id)
             )),
+            Agent::Claude => {
+                commands.push(format!("exec claude --resume {}", shell_quote(session.id)))
+            }
             Agent::Codex => commands.push(format!("exec codex resume {}", shell_quote(session.id))),
         },
         Some(session) => {
@@ -569,6 +584,7 @@ mod tests {
             scrollback_file: None,
             codex_session_id: None,
             amp_thread_id: Some("T-01a023e2-3f9d-7705-98ed-4ea63108e87e".into()),
+            claude_session_id: None,
         }
     }
 
@@ -612,6 +628,23 @@ mod tests {
         assert!(command.contains("Amp thread already running"));
         assert!(!command.contains("exec amp threads continue"));
         assert_eq!(duplicates.len(), 1);
+    }
+
+    #[test]
+    fn restores_claude_sessions() {
+        let mut terminal = terminal();
+        terminal.amp_thread_id = None;
+        terminal.claude_session_id = Some("b1fa0daa-ce10-446e-9648-e838f1b192b2".into());
+        let command = restore_command(
+            &terminal,
+            Path::new("/tmp/state"),
+            &HashSet::new(),
+            &mut Vec::new(),
+            Path::new("/Users/me/project"),
+            None,
+        );
+        assert!(command.contains("exec claude --resume"));
+        assert!(command.contains("b1fa0daa-ce10-446e-9648-e838f1b192b2"));
     }
 
     #[test]

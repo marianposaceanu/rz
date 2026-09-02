@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -58,6 +58,7 @@ pub fn running_sessions() -> Result<Vec<AgentSession>> {
                 .find(command)
                 .map(|id| id.as_str().to_owned())
                 .or_else(|| open_amp_thread(pid)),
+            Agent::Claude => open_claude_session(pid),
         },
     ))
 }
@@ -85,6 +86,8 @@ fn discover_sessions(
                 Agent::Codex
             } else if amp_process(&process.command) {
                 Agent::Amp
+            } else if claude_process(&process.command) {
+                Agent::Claude
             } else {
                 return None;
             };
@@ -127,11 +130,19 @@ fn codex_process(command: &str) -> bool {
 }
 
 fn amp_process(command: &str) -> bool {
+    executable_named(command, "amp")
+}
+
+fn claude_process(command: &str) -> bool {
+    executable_named(command, "claude")
+}
+
+fn executable_named(command: &str, name: &str) -> bool {
     command
         .split_whitespace()
         .next()
         .and_then(|program| Path::new(program).file_name())
-        .is_some_and(|program| program == "amp")
+        .is_some_and(|program| program == name)
 }
 
 fn ghostty_process(command: &str) -> bool {
@@ -201,6 +212,29 @@ fn amp_thread_from_lsof(output: &str) -> Option<String> {
         })
         .collect::<BTreeSet<_>>();
     (ids.len() == 1).then(|| ids.into_iter().next()).flatten()
+}
+
+fn open_claude_session(pid: u32) -> Option<String> {
+    let home = env::var_os("HOME")?;
+    claude_session_from_file(
+        pid,
+        &PathBuf::from(home)
+            .join(".claude/sessions")
+            .join(format!("{pid}.json")),
+    )
+}
+
+fn claude_session_from_file(pid: u32, path: &Path) -> Option<String> {
+    let metadata =
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).ok()?).ok()?;
+    if metadata.get("pid")?.as_u64()? != u64::from(pid) {
+        return None;
+    }
+    let id = metadata.get("sessionId")?.as_str()?;
+    UUID_PATTERN
+        .find(id)
+        .filter(|matched| matched.as_str() == id)
+        .map(|_| id.to_owned())
 }
 
 pub fn assign_sessions(
@@ -430,6 +464,9 @@ fn agent_title(title: &str, cwd: &Path, agent: Agent) -> bool {
     if agent == Agent::Amp {
         return amp_title(title);
     }
+    if agent == Agent::Claude {
+        return claude_title(title);
+    }
     let basename = cwd
         .file_name()
         .and_then(|name| name.to_str())
@@ -448,6 +485,16 @@ fn agent_title(title: &str, cwd: &Path, agent: Agent) -> bool {
 fn amp_title(title: &str) -> bool {
     let normalized = title.trim().to_ascii_lowercase();
     normalized == "amp" || normalized.contains(" - amp - ") || normalized.ends_with(" - amp")
+}
+
+fn claude_title(title: &str) -> bool {
+    let title = title.trim();
+    let normalized = title.to_ascii_lowercase();
+    normalized == "claude"
+        || normalized.starts_with("claude |")
+        || normalized.contains(" - claude")
+        || title.starts_with("✳ ")
+        || title.starts_with("◑ ")
 }
 
 fn stable_title(title: &str) -> &str {
@@ -479,6 +526,7 @@ mod tests {
     use super::*;
 
     const AMP_ID: &str = "T-01a023e2-3f9d-7705-98ed-4ea63108e87e";
+    const CLAUDE_ID: &str = "b1fa0daa-ce10-446e-9648-e838f1b192b2";
     const CODEX_ID: &str = "019f7eb7-dc72-75b3-b042-91599cdd90ac";
 
     fn session(agent: Agent, tty: &str, cwd: &str, id: &str) -> AgentSession {
@@ -529,10 +577,27 @@ mod tests {
     }
 
     #[test]
+    fn reads_claude_session_metadata_for_the_process() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("300.json");
+        fs::write(
+            &path,
+            format!(r#"{{"pid":300,"sessionId":"{CLAUDE_ID}","cwd":"/Users/me/project"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            claude_session_from_file(300, &path).as_deref(),
+            Some(CLAUDE_ID)
+        );
+        assert_eq!(claude_session_from_file(301, &path), None);
+    }
+
+    #[test]
     fn discovery_only_inspects_supported_ghostty_agents() {
         let ps = " 100 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
                   200 100 ttys016 /bin/zsh -l\n\
                   300 200 ttys016 amp\n\
+                  350 200 ttys017 claude\n\
                   400 200 ttys016 /usr/bin/sleep 60";
         let mut inspected = Vec::new();
         let sessions = discover_sessions(
@@ -541,26 +606,40 @@ mod tests {
                 inspected.push(pid);
                 Some("/Users/me/project".into())
             },
-            |_, _, _| Some(AMP_ID.into()),
+            |_, agent, _| {
+                Some(match agent {
+                    Agent::Amp => AMP_ID.into(),
+                    Agent::Claude => CLAUDE_ID.into(),
+                    Agent::Codex => CODEX_ID.into(),
+                })
+            },
         );
-        assert_eq!(inspected, vec![300]);
-        assert_eq!(sessions.len(), 1);
+        assert_eq!(inspected, vec![300, 350]);
+        assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].agent, Agent::Amp);
+        assert_eq!(sessions[1].agent, Agent::Claude);
     }
 
     #[test]
-    fn matches_amp_and_codex_titles_in_the_same_directory() {
+    fn matches_agent_titles_in_the_same_directory() {
         let cwd = "/Users/me/dot-files";
         let rows = vec![
             row("amp-terminal", "⣒ display task - amp - ~/dot-files", cwd),
+            row("claude-terminal", "✳ Implement session restore", cwd),
             row("codex-terminal", "codex | dot-files", cwd),
         ];
         let amp = session(Agent::Amp, "ttys016", cwd, AMP_ID);
+        let claude = session(Agent::Claude, "ttys017", cwd, CLAUDE_ID);
         let codex = session(Agent::Codex, "ttys004", cwd, CODEX_ID);
         let temp = TempDir::new().unwrap();
-        let (assigned, warnings) =
-            assign_sessions(&rows, &[codex.clone(), amp.clone()], temp.path(), true);
+        let (assigned, warnings) = assign_sessions(
+            &rows,
+            &[codex.clone(), amp.clone(), claude.clone()],
+            temp.path(),
+            true,
+        );
         assert_eq!(assigned["amp-terminal"], amp);
+        assert_eq!(assigned["claude-terminal"], claude);
         assert_eq!(assigned["codex-terminal"], codex);
         assert!(warnings.is_empty());
     }

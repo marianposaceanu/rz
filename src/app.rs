@@ -229,6 +229,10 @@ impl App {
                     .count(),
                 terminals
                     .iter()
+                    .filter(|terminal| terminal.claude_session_id.is_some())
+                    .count(),
+                terminals
+                    .iter()
                     .filter(|terminal| terminal.scrollback_file.is_some())
                     .count(),
                 options.capture_scrollback,
@@ -539,6 +543,10 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                     .count(),
                 terminals
                     .iter()
+                    .filter(|terminal| terminal.claude_session_id.is_some())
+                    .count(),
+                terminals
+                    .iter()
                     .filter(|terminal| terminal.scrollback_file.is_some())
                     .count(),
                 snapshot.scrollback_captured,
@@ -599,6 +607,9 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                 if let Some(id) = &terminal.amp_thread_id {
                     lines.push(ui::labeled("AMP", id));
                 }
+                if let Some(id) = &terminal.claude_session_id {
+                    lines.push(ui::labeled("CLAUDE", id));
+                }
             }
         }
     }
@@ -629,6 +640,10 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
     let amp = sessions
         .iter()
         .filter(|session| session.agent == Agent::Amp)
+        .collect::<Vec<_>>();
+    let claude = sessions
+        .iter()
+        .filter(|session| session.agent == Agent::Claude)
         .collect::<Vec<_>>();
     let mut lines = vec![
         ui::labeled("STATUS", "Dry run - Ghostty will not be changed"),
@@ -676,6 +691,19 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
         amp.iter()
             .map(|session| format!("              {}", session.id)),
     );
+    lines.push(ui::labeled(
+        "CLAUDE",
+        if claude.is_empty() {
+            "none".into()
+        } else {
+            format!("{} session(s)", claude.len())
+        },
+    ));
+    lines.extend(
+        claude
+            .iter()
+            .map(|session| format!("              {}", session.id)),
+    );
     lines.push(ui::labeled("LOCATION", directory.to_string_lossy()));
     lines.extend(
         snapshot
@@ -715,13 +743,21 @@ fn saved_tab_lines(snapshot: &Snapshot) -> Vec<String> {
         .collect()
 }
 
-fn content_summary(codex: usize, amp: usize, scrollback: usize, captured: bool) -> String {
+fn content_summary(
+    codex: usize,
+    amp: usize,
+    claude: usize,
+    scrollback: usize,
+    captured: bool,
+) -> String {
     let scrollback = if captured {
         format!("{scrollback} scrollback file(s)")
     } else {
         "scrollback skipped".into()
     };
-    format!("{codex} Codex session(s)  |  {amp} Amp thread(s)  |  {scrollback}")
+    format!(
+        "{codex} Codex session(s)  |  {amp} Amp thread(s)  |  {claude} Claude session(s)  |  {scrollback}"
+    )
 }
 
 fn display_time(value: &str) -> String {
@@ -793,6 +829,7 @@ mod tests {
             "/tmp/project"
         );
         assert_eq!(snapshot.detected_codex_sessions[0].agent, Agent::Codex);
+        assert!(snapshot.detected_claude_sessions.is_empty());
     }
 
     #[test]

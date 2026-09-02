@@ -30,6 +30,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub detected_amp_threads: Vec<AgentSession>,
     #[serde(default)]
+    pub detected_claude_sessions: Vec<AgentSession>,
+    #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
     pub limitations: Vec<String>,
@@ -102,6 +104,8 @@ pub struct Terminal {
     pub codex_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amp_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 impl Terminal {
@@ -111,9 +115,14 @@ impl Terminal {
                 agent: Agent::Codex,
                 id,
             })
-        } else {
-            self.amp_thread_id.as_deref().map(|id| SessionRef {
+        } else if let Some(id) = self.amp_thread_id.as_deref() {
+            Some(SessionRef {
                 agent: Agent::Amp,
+                id,
+            })
+        } else {
+            self.claude_session_id.as_deref().map(|id| SessionRef {
+                agent: Agent::Claude,
                 id,
             })
         }
@@ -124,6 +133,7 @@ impl Terminal {
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
     Amp,
+    Claude,
     Codex,
 }
 
@@ -131,6 +141,7 @@ impl Agent {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Claude => "Claude",
             Self::Codex => "Codex",
         }
     }
@@ -138,6 +149,7 @@ impl Agent {
     pub const fn unit(self) -> &'static str {
         match self {
             Self::Amp => "thread",
+            Self::Claude => "session",
             Self::Codex => "session",
         }
     }
@@ -147,6 +159,7 @@ impl fmt::Display for Agent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Amp => "amp",
+            Self::Claude => "claude",
             Self::Codex => "codex",
         })
     }

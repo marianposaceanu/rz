@@ -68,13 +68,21 @@ thread, and `claude --resume` for a Claude Code session. If the same session is
 still running during an additive restore, `rz` opens a plain shell instead of
 starting a duplicate.
 
+Only interactive terminal CLIs are detected. Codex conversations are looked up in
+`~/.codex/state_*.sqlite` by working directory and start time, with the older
+open rollout file as a fallback. Claude Code sessions come from
+`~/.claude/sessions/<pid>.json`; background sessions and sessions started by an
+IDE or the SDK are ignored.
+
 ## Limits
 
 Ghostty exposes terminal surfaces but not its split tree or pane proportions, so
 additional surfaces restore as right-hand splits. Scrollback is replayed as text,
 not as a running process. `rz` can resume detected Codex conversations, Amp
 threads, and Claude Code sessions by their exact IDs, but it cannot reconstruct
-arbitrary programs.
+arbitrary programs. A Codex conversation resumed through the picker is only
+recognised once it has received a message, and when several conversations in
+one directory are active at the same time none of them is guessed.
 
 ## Development
 

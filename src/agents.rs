@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use regex::Regex;
+use serde::Deserialize;
 
 use crate::{
     command,
@@ -27,6 +29,8 @@ static CODEX_RESUME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static AMP_THREAD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)T-{}", UUID_PATTERN.as_str())).expect("valid Amp thread regex")
 });
+static SHELL_PROMPT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[^\s@]+@[^\s:]+:").expect("valid shell prompt regex"));
 static CODEX_ROLLOUT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r"\s(/.*rollout-[^ ]+-({})\.jsonl)\s*$",
@@ -43,22 +47,25 @@ struct Process {
     command: String,
 }
 
-pub fn running_sessions() -> Result<Vec<AgentSession>> {
+const CODEX_START_TOLERANCE_SECONDS: i64 = 10;
+
+pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
     let output = command::run("ps", &["-axo", "pid=,ppid=,tty=,command="])?;
     Ok(discover_sessions(
         &output,
         process_cwd,
-        |pid, agent, command| match agent {
+        |pid, agent, command, cwd| match agent {
             Agent::Codex => CODEX_RESUME_PATTERN
                 .captures(command)
                 .and_then(|captures| captures.get(1))
                 .map(|id| id.as_str().to_owned())
+                .or_else(|| codex_thread_for_process(home, pid, cwd))
                 .or_else(|| newest_open_codex_session(pid)),
             Agent::Amp => AMP_THREAD_PATTERN
                 .find(command)
                 .map(|id| id.as_str().to_owned())
                 .or_else(|| open_amp_thread(pid)),
-            Agent::Claude => open_claude_session(pid),
+            Agent::Claude => claude_session_for_process(home, pid),
         },
     ))
 }
@@ -66,7 +73,7 @@ pub fn running_sessions() -> Result<Vec<AgentSession>> {
 fn discover_sessions(
     ps_output: &str,
     mut cwd_for_pid: impl FnMut(u32) -> Option<PathBuf>,
-    mut id_for_process: impl FnMut(u32, Agent, &str) -> Option<String>,
+    mut id_for_process: impl FnMut(u32, Agent, &str, &Path) -> Option<String>,
 ) -> Vec<AgentSession> {
     let processes = parse_processes(ps_output);
     let by_pid = processes
@@ -82,6 +89,9 @@ fn discover_sessions(
     processes
         .iter()
         .filter_map(|process| {
+            if process.tty == "??" {
+                return None;
+            }
             let agent = if codex_process(&process.command) {
                 Agent::Codex
             } else if amp_process(&process.command) {
@@ -95,7 +105,7 @@ fn discover_sessions(
                 return None;
             }
             let cwd = cwd_for_pid(process.pid)?;
-            let session_id = id_for_process(process.pid, agent, &process.command)?;
+            let session_id = id_for_process(process.pid, agent, &process.command, &cwd)?;
             Some(AgentSession {
                 agent,
                 pid: process.pid,
@@ -214,27 +224,146 @@ fn amp_thread_from_lsof(output: &str) -> Option<String> {
     (ids.len() == 1).then(|| ids.into_iter().next()).flatten()
 }
 
-fn open_claude_session(pid: u32) -> Option<String> {
-    let home = env::var_os("HOME")?;
-    claude_session_from_file(
-        pid,
-        &PathBuf::from(home)
-            .join(".claude/sessions")
-            .join(format!("{pid}.json")),
-    )
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionFile {
+    pid: u32,
+    session_id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    entrypoint: String,
 }
 
-fn claude_session_from_file(pid: u32, path: &Path) -> Option<String> {
-    let metadata =
-        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).ok()?).ok()?;
-    if metadata.get("pid")?.as_u64()? != u64::from(pid) {
-        return None;
+fn claude_session_for_process(home: &Path, pid: u32) -> Option<String> {
+    let path = home.join(".claude/sessions").join(format!("{pid}.json"));
+    let session =
+        serde_json::from_str::<ClaudeSessionFile>(&fs::read_to_string(path).ok()?).ok()?;
+    let interactive_cli = session.pid == pid
+        && session.kind == "interactive"
+        && session.entrypoint == "cli"
+        && UUID_PATTERN
+            .find(&session.session_id)
+            .is_some_and(|matched| matched.as_str() == session.session_id);
+    interactive_cli.then_some(session.session_id)
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexThread {
+    id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<i64>,
+    #[serde(default)]
+    originator: Option<String>,
+}
+
+fn codex_thread_for_process(home: &Path, pid: u32, cwd: &Path) -> Option<String> {
+    let database = codex_state_database(home)?;
+    let started_at = process_started_at(pid)?;
+    let query = format!(
+        "SELECT id, cwd, created_at, updated_at, originator FROM threads WHERE archived = 0 AND updated_at >= {}",
+        started_at - CODEX_START_TOLERANCE_SECONDS
+    );
+    let database = database.to_string_lossy();
+    let output = command::try_run(
+        "/usr/bin/sqlite3",
+        &["-readonly", "-json", database.as_ref(), query.as_str()],
+    )?;
+    let threads = parse_codex_threads(&output)?;
+    select_codex_thread(&threads, cwd, started_at)
+}
+
+fn codex_state_database(home: &Path) -> Option<PathBuf> {
+    fs::read_dir(home.join(".codex"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let version = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u32>()
+                .ok()?;
+            Some((version, path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+fn parse_codex_threads(output: &str) -> Option<Vec<CodexThread>> {
+    let output = output.trim();
+    if output.is_empty() {
+        return Some(Vec::new());
     }
-    let id = metadata.get("sessionId")?.as_str()?;
-    UUID_PATTERN
-        .find(id)
-        .filter(|matched| matched.as_str() == id)
-        .map(|_| id.to_owned())
+    serde_json::from_str(output).ok()
+}
+
+fn select_codex_thread(threads: &[CodexThread], cwd: &Path, started_at: i64) -> Option<String> {
+    let in_directory = threads
+        .iter()
+        .filter(|thread| Path::new(&thread.cwd) == cwd)
+        .collect::<Vec<_>>();
+    let started_with_process = in_directory
+        .iter()
+        .filter(|thread| {
+            thread.created_at.is_some_and(|created_at| {
+                (created_at - started_at).abs() <= CODEX_START_TOLERANCE_SECONDS
+            })
+        })
+        .collect::<Vec<_>>();
+    if let [thread] = started_with_process.as_slice() {
+        return Some(thread.id.clone());
+    }
+    let active = in_directory
+        .iter()
+        .filter(|thread| {
+            tui_thread(thread)
+                && thread
+                    .updated_at
+                    .is_some_and(|updated_at| updated_at >= started_at)
+        })
+        .collect::<Vec<_>>();
+    match active.as_slice() {
+        [thread] => Some(thread.id.clone()),
+        _ => None,
+    }
+}
+
+fn tui_thread(thread: &CodexThread) -> bool {
+    thread
+        .originator
+        .as_deref()
+        .is_none_or(|originator| originator.is_empty() || originator == "codex-tui")
+}
+
+fn process_started_at(pid: u32) -> Option<i64> {
+    let output = command::try_run("ps", &["-o", "etime=", "-p", &pid.to_string()])?;
+    let elapsed = parse_elapsed_seconds(output.trim())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(i64::try_from(now).ok()? - elapsed)
+}
+
+fn parse_elapsed_seconds(value: &str) -> Option<i64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<i64>().ok()?, clock),
+        None => (0, value),
+    };
+    let parts = clock
+        .split(':')
+        .map(|part| part.parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0, *minutes, *seconds),
+        [hours, minutes, seconds] => (*hours, *minutes, *seconds),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + minutes) * 60 + seconds)
 }
 
 pub fn assign_sessions(
@@ -283,7 +412,9 @@ pub fn assign_sessions(
         let candidates = rows
             .iter()
             .filter(|row| {
-                !assignments.contains_key(&row.terminal_id) && row.working_directory == cwd
+                !assignments.contains_key(&row.terminal_id)
+                    && row.working_directory == cwd
+                    && !shell_title(&row.terminal_name)
             })
             .collect::<Vec<_>>();
         for (session, row) in cwd_sessions.into_iter().zip(candidates) {
@@ -491,10 +622,18 @@ fn claude_title(title: &str) -> bool {
     let title = title.trim();
     let normalized = title.to_ascii_lowercase();
     normalized == "claude"
-        || normalized.starts_with("claude |")
+        || normalized.starts_with("claude ")
         || normalized.contains(" - claude")
         || title.starts_with("✳ ")
         || title.starts_with("◑ ")
+}
+
+fn shell_title(title: &str) -> bool {
+    let normalized = title.trim();
+    normalized.starts_with('~')
+        || normalized.starts_with('/')
+        || normalized.starts_with("…/")
+        || SHELL_PROMPT_PATTERN.is_match(normalized)
 }
 
 fn stable_title(title: &str) -> &str {
@@ -577,19 +716,54 @@ mod tests {
     }
 
     #[test]
-    fn reads_claude_session_metadata_for_the_process() {
+    fn reads_only_interactive_cli_claude_sessions() {
         let temp = TempDir::new().unwrap();
-        let path = temp.path().join("300.json");
-        fs::write(
-            &path,
-            format!(r#"{{"pid":300,"sessionId":"{CLAUDE_ID}","cwd":"/Users/me/project"}}"#),
-        )
-        .unwrap();
-        assert_eq!(
-            claude_session_from_file(300, &path).as_deref(),
-            Some(CLAUDE_ID)
+        let sessions = temp.path().join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (file, pid, kind, entrypoint) in [
+            (300, 300, "interactive", "cli"),
+            (301, 301, "bg", "cli"),
+            (302, 302, "interactive", "sdk"),
+            (303, 999, "interactive", "cli"),
+        ] {
+            let content = format!(
+                r#"{{"pid":{pid},"sessionId":"{CLAUDE_ID}","kind":"{kind}","entrypoint":"{entrypoint}"}}"#
+            );
+            fs::write(sessions.join(format!("{file}.json")), content).unwrap();
+        }
+        let ids = (300..=304)
+            .map(|pid| claude_session_for_process(temp.path(), pid))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![Some(CLAUDE_ID.into()), None, None, None, None]);
+    }
+
+    #[test]
+    fn selects_codex_threads_from_query_output() {
+        let cwd = Path::new("/Users/me/project");
+        let rows = format!(
+            r#"[{{"id":"{CODEX_ID}","cwd":"/Users/me/project","created_at":1001,"updated_at":5000,"originator":"codex-tui"}},
+                {{"id":"resumed","cwd":"/Users/me/project","created_at":100,"updated_at":5000,"originator":null}},
+                {{"id":"stale","cwd":"/Users/me/project","created_at":200,"updated_at":900,"originator":"codex-tui"}},
+                {{"id":"ide","cwd":"/Users/me/project","created_at":300,"updated_at":6000,"originator":"vscode"}},
+                {{"id":"elsewhere","cwd":"/Users/me/other","created_at":1000,"updated_at":7000,"originator":"codex-tui"}}]"#
         );
-        assert_eq!(claude_session_from_file(301, &path), None);
+        let threads = parse_codex_threads(&rows).unwrap();
+        assert_eq!(threads.len(), 5);
+        assert!(parse_codex_threads(" \n").unwrap().is_empty());
+        assert!(parse_codex_threads("Error: unable to open database").is_none());
+        assert_eq!(
+            select_codex_thread(&threads, cwd, 1_000).as_deref(),
+            Some(CODEX_ID)
+        );
+        assert_eq!(
+            select_codex_thread(&threads[1..], cwd, 1_000).as_deref(),
+            Some("resumed")
+        );
+        assert_eq!(select_codex_thread(&threads[..2], cwd, 2_000), None);
+        assert_eq!(
+            parse_elapsed_seconds("03-07:25:55"),
+            Some(3 * 86_400 + 7 * 3_600 + 25 * 60 + 55)
+        );
     }
 
     #[test]
@@ -597,8 +771,13 @@ mod tests {
         let ps = " 100 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
                   200 100 ttys016 /bin/zsh -l\n\
                   300 200 ttys016 amp\n\
+                  310 300 ?? /opt/homebrew/Cellar/ampcode/0.0.1/bin/amp run /tmp/plugin-runtime.ts\n\
                   350 200 ttys017 claude\n\
-                  400 200 ttys016 /usr/bin/sleep 60";
+                  360 350 ?? claude bg-pty-host --bg-pty-host /tmp/spare.pty.sock\n\
+                  400 200 ttys016 /usr/bin/sleep 60\n\
+                  600 1 ?? /Users/me/.local/bin/claude daemon run\n\
+                  700 200 ttys018 /opt/homebrew/lib/node_modules/@openai/codex/vendor/bin/codex\n\
+                  800 1 ?? /Users/me/.codex/packages/app-server-daemon/bin/codex app-server daemon";
         let mut inspected = Vec::new();
         let sessions = discover_sessions(
             ps,
@@ -606,7 +785,7 @@ mod tests {
                 inspected.push(pid);
                 Some("/Users/me/project".into())
             },
-            |_, agent, _| {
+            |_, agent, _, _| {
                 Some(match agent {
                     Agent::Amp => AMP_ID.into(),
                     Agent::Claude => CLAUDE_ID.into(),
@@ -614,10 +793,31 @@ mod tests {
                 })
             },
         );
-        assert_eq!(inspected, vec![300, 350]);
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].agent, Agent::Amp);
-        assert_eq!(sessions[1].agent, Agent::Claude);
+        assert_eq!(inspected, vec![300, 350, 700]);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.agent)
+                .collect::<Vec<_>>(),
+            vec![Agent::Amp, Agent::Claude, Agent::Codex]
+        );
+    }
+
+    #[test]
+    fn skips_shell_titled_terminals_when_pairing_by_directory() {
+        let cwd = "/Users/me/fws-cms";
+        let rows = vec![
+            row("shell", "marian@MBAM4:~/work/fws-cms", cwd),
+            row("path", "~/work/fws-cms", cwd),
+            row("agent", "set-default-model", cwd),
+        ];
+        let session = session(Agent::Claude, "ttys013", cwd, CLAUDE_ID);
+        let temp = TempDir::new().unwrap();
+        let (assigned, warnings) =
+            assign_sessions(&rows, std::slice::from_ref(&session), temp.path(), true);
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned["agent"], session);
+        assert!(warnings.is_empty());
     }
 
     #[test]

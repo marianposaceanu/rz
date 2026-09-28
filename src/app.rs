@@ -137,7 +137,7 @@ impl App {
             }
             bail!("Ghostty has no restorable terminal surfaces");
         }
-        let process_sessions = agents::running_sessions()?;
+        let process_sessions = agents::running_sessions(&self.home)?;
         let (assignments, mut warnings) = agents::assign_sessions(
             &rows,
             &process_sessions,
@@ -268,7 +268,7 @@ impl App {
         let running_sessions = if options.close_existing {
             HashSet::new()
         } else {
-            agents::running_sessions()?
+            agents::running_sessions(&self.home)?
                 .into_iter()
                 .map(|session| session.key())
                 .collect()

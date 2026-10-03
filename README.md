@@ -13,9 +13,19 @@ Ghostty windows. Use `--keep-existing` when you want an additive restore instead
 
 ## Install
 
+Install with [Homebrew](https://brew.sh/) from
+[Marian’s tap](https://github.com/marianposaceanu/homebrew-tap):
+
 ```sh
 brew tap marianposaceanu/tap
 brew install rz
+```
+
+To upgrade to the latest release:
+
+```sh
+brew update
+brew upgrade rz
 ```
 
 `rz` requires macOS and a recent Ghostty release with its AppleScript API

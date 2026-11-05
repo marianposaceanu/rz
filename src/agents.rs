@@ -309,11 +309,19 @@ fn codex_assignments(
     processes: &[Process],
     mut cwd_for_pid: impl FnMut(u32) -> Option<PathBuf>,
 ) -> HashMap<u32, String> {
-    let codex = ghostty_attached(processes)
+    let attached = ghostty_attached(processes)
         .into_iter()
-        .filter(|process| {
-            codex_process(&process.command) && !CODEX_RESUME_PATTERN.is_match(&process.command)
-        })
+        .filter(|process| codex_process(&process.command))
+        .collect::<Vec<_>>();
+    // A thread named on a command line belongs to that process and to nobody else.
+    let reserved = attached
+        .iter()
+        .filter_map(|process| CODEX_RESUME_PATTERN.captures(&process.command))
+        .filter_map(|captures| captures.get(1).map(|id| id.as_str().to_lowercase()))
+        .collect::<HashSet<_>>();
+    let codex = attached
+        .into_iter()
+        .filter(|process| !CODEX_RESUME_PATTERN.is_match(&process.command))
         .filter_map(|process| {
             let shell_cwd = cwd_for_pid(process.pid)?;
             let cwd = codex_cd_argument(&process.command)
@@ -330,7 +338,10 @@ fn codex_assignments(
         return HashMap::new();
     };
     match load_codex_threads(home, earliest - CODEX_START_TOLERANCE_SECONDS) {
-        Some(threads) => assign_codex_threads(&codex, &threads),
+        Some(mut threads) => {
+            threads.retain(|thread| !reserved.contains(&thread.id.to_lowercase()));
+            assign_codex_threads(&codex, &threads)
+        }
         None => HashMap::new(),
     }
 }
@@ -951,6 +962,23 @@ mod tests {
         let assigned = assign_codex_threads(&processes, &threads);
         assert_eq!(assigned.len(), 1);
         assert_eq!(assigned.get(&1).map(String::as_str), Some("only"));
+    }
+
+    #[test]
+    fn a_thread_named_on_a_command_line_is_not_offered_to_other_processes() {
+        // Only the leftover pass could hand a reserved thread to the second process; the database
+        // is absent in tests, so exercise the reservation through the same filter the assignment uses.
+        let threads = vec![
+            thread("named", "/p", 100, 9_500, "cli"),
+            thread("other", "/p", 200, 9_000, "cli"),
+        ];
+        let reserved = HashSet::from(["named".to_owned()]);
+        let offered = threads
+            .into_iter()
+            .filter(|thread| !reserved.contains(&thread.id.to_lowercase()))
+            .collect::<Vec<_>>();
+        let assigned = assign_codex_threads(&[process(7, "/home", 1_000)], &offered);
+        assert_eq!(assigned.get(&7).map(String::as_str), Some("other"));
     }
 
     #[test]

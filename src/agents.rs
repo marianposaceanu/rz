@@ -1017,7 +1017,7 @@ mod tests {
         let snapshots = TempDir::new().unwrap();
         let scraper = session(Agent::Codex, "ttys000", "/Users/me/work/scraper", CODEX_ID);
         let rows = vec![row("home-shell", "marian", "/Users/me"), row("scraper-tab", "scraper", "/Users/me")];
-        let (assigned, _) = assign_sessions(&rows, &[scraper.clone()], snapshots.path(), false);
+        let (assigned, _) = assign_sessions(&rows, std::slice::from_ref(&scraper), snapshots.path(), false);
         assert_eq!(assigned.get("scraper-tab").map(|s| s.session_id.as_str()), Some(CODEX_ID));
         assert!(!assigned.contains_key("home-shell"));
 

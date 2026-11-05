@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -26,6 +26,9 @@ static CODEX_RESUME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)\bresume\s+({})", UUID_PATTERN.as_str()))
         .expect("valid Codex resume regex")
 });
+static CODEX_CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|\s)(?:-C|--cd)(?:=|\s+)("[^"]+"|'[^']+'|\S+)"#).expect("valid Codex cd regex")
+});
 static AMP_THREAD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)T-{}", UUID_PATTERN.as_str())).expect("valid Amp thread regex")
 });
@@ -51,15 +54,16 @@ const CODEX_START_TOLERANCE_SECONDS: i64 = 10;
 
 pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
     let output = command::run("ps", &["-axo", "pid=,ppid=,tty=,command="])?;
+    let codex_threads = codex_assignments(home, &parse_processes(&output), process_cwd);
     Ok(discover_sessions(
         &output,
         process_cwd,
-        |pid, agent, command, cwd| match agent {
+        |pid, agent, command, _| match agent {
             Agent::Codex => CODEX_RESUME_PATTERN
                 .captures(command)
                 .and_then(|captures| captures.get(1))
                 .map(|id| id.as_str().to_owned())
-                .or_else(|| codex_thread_for_process(home, pid, cwd))
+                .or_else(|| codex_threads.get(&pid).cloned())
                 .or_else(|| newest_open_codex_session(pid)),
             Agent::Amp => AMP_THREAD_PATTERN
                 .find(command)
@@ -76,22 +80,9 @@ fn discover_sessions(
     mut id_for_process: impl FnMut(u32, Agent, &str, &Path) -> Option<String>,
 ) -> Vec<AgentSession> {
     let processes = parse_processes(ps_output);
-    let by_pid = processes
-        .iter()
-        .map(|process| (process.pid, process))
-        .collect::<HashMap<_, _>>();
-    let ghostty_pids = processes
-        .iter()
-        .filter(|process| ghostty_process(&process.command))
-        .map(|process| process.pid)
-        .collect::<HashSet<_>>();
-
-    processes
-        .iter()
+    ghostty_attached(&processes)
+        .into_iter()
         .filter_map(|process| {
-            if process.tty == "??" {
-                return None;
-            }
             let agent = if codex_process(&process.command) {
                 Agent::Codex
             } else if amp_process(&process.command) {
@@ -101,9 +92,6 @@ fn discover_sessions(
             } else {
                 return None;
             };
-            if !ghostty_pids.is_empty() && !descends_from(process, &ghostty_pids, &by_pid) {
-                return None;
-            }
             let cwd = cwd_for_pid(process.pid)?;
             let session_id = id_for_process(process.pid, agent, &process.command, &cwd)?;
             Some(AgentSession {
@@ -114,6 +102,27 @@ fn discover_sessions(
                 session_id,
                 command: process.command.clone(),
             })
+        })
+        .collect()
+}
+
+/// Interactive processes that live in a Ghostty terminal: they have a tty and, when Ghostty is
+/// running, descend from it.
+fn ghostty_attached(processes: &[Process]) -> Vec<&Process> {
+    let by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let ghostty_pids = processes
+        .iter()
+        .filter(|process| ghostty_process(&process.command))
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    processes
+        .iter()
+        .filter(|process| {
+            process.tty != "??"
+                && (ghostty_pids.is_empty() || descends_from(process, &ghostty_pids, &by_pid))
         })
         .collect()
 }
@@ -259,22 +268,91 @@ struct CodexThread {
     updated_at: Option<i64>,
     #[serde(default)]
     originator: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
-fn codex_thread_for_process(home: &Path, pid: u32, cwd: &Path) -> Option<String> {
+impl CodexThread {
+    fn cwd(&self) -> &Path {
+        Path::new(&self.cwd)
+    }
+
+    /// A thread a person drives in a terminal: not a subagent spawned by another thread (its
+    /// `source` is a JSON object), not a `codex exec` run, and started by the TUI.
+    fn interactive(&self) -> bool {
+        let source = self.source.as_deref().unwrap_or("");
+        !source.starts_with('{')
+            && source != "exec"
+            && self
+                .originator
+                .as_deref()
+                .is_none_or(|originator| originator.is_empty() || originator == "codex-tui")
+    }
+
+    fn updated_since(&self, moment: i64) -> bool {
+        self.updated_at.is_some_and(|updated_at| updated_at >= moment)
+    }
+}
+
+/// A running Codex TUI whose thread id is not on its command line.
+#[derive(Debug, Clone)]
+struct CodexProcess {
+    pid: u32,
+    cwd: PathBuf,
+    started_at: i64,
+}
+
+/// Which thread each running Codex TUI is driving, decided for all of them at once so that two
+/// sessions in the same directory cannot claim the same thread.
+fn codex_assignments(
+    home: &Path,
+    processes: &[Process],
+    mut cwd_for_pid: impl FnMut(u32) -> Option<PathBuf>,
+) -> HashMap<u32, String> {
+    let codex = ghostty_attached(processes)
+        .into_iter()
+        .filter(|process| {
+            codex_process(&process.command) && !CODEX_RESUME_PATTERN.is_match(&process.command)
+        })
+        .filter_map(|process| {
+            let shell_cwd = cwd_for_pid(process.pid)?;
+            let cwd = codex_cd_argument(&process.command)
+                .map(|dir| shell_cwd.join(dir))
+                .unwrap_or(shell_cwd);
+            Some(CodexProcess {
+                pid: process.pid,
+                cwd,
+                started_at: process_started_at(process.pid)?,
+            })
+        })
+        .collect::<Vec<_>>();
+    let Some(earliest) = codex.iter().map(|process| process.started_at).min() else {
+        return HashMap::new();
+    };
+    match load_codex_threads(home, earliest - CODEX_START_TOLERANCE_SECONDS) {
+        Some(threads) => assign_codex_threads(&codex, &threads),
+        None => HashMap::new(),
+    }
+}
+
+/// `-C dir` or `--cd dir` on the command line moves the thread's directory away from the shell's.
+fn codex_cd_argument(command: &str) -> Option<PathBuf> {
+    let raw = CODEX_CD_PATTERN.captures(command)?.get(1)?.as_str();
+    let dir = raw.trim_matches(|c| c == '"' || c == '\'');
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
+}
+
+fn load_codex_threads(home: &Path, updated_since: i64) -> Option<Vec<CodexThread>> {
     let database = codex_state_database(home)?;
-    let started_at = process_started_at(pid)?;
     let query = format!(
-        "SELECT id, cwd, created_at, updated_at, originator FROM threads WHERE archived = 0 AND updated_at >= {}",
-        started_at - CODEX_START_TOLERANCE_SECONDS
+        "SELECT id, cwd, created_at, updated_at, originator, source FROM threads WHERE archived = 0 AND updated_at >= {updated_since}"
     );
     let database = database.to_string_lossy();
     let output = command::try_run(
         "/usr/bin/sqlite3",
         &["-readonly", "-json", database.as_ref(), query.as_str()],
     )?;
-    let threads = parse_codex_threads(&output)?;
-    select_codex_thread(&threads, cwd, started_at)
+    parse_codex_threads(&output)
 }
 
 fn codex_state_database(home: &Path) -> Option<PathBuf> {
@@ -304,42 +382,96 @@ fn parse_codex_threads(output: &str) -> Option<Vec<CodexThread>> {
     serde_json::from_str(output).ok()
 }
 
-fn select_codex_thread(threads: &[CodexThread], cwd: &Path, started_at: i64) -> Option<String> {
-    let in_directory = threads
+/// Three passes, each only over threads nobody has claimed yet:
+/// 1. a thread created within a few seconds of the process, in its directory: a fresh session;
+/// 2. per directory, the processes in start order take the most recently updated threads there in
+///    creation order: resumed sessions sharing a directory;
+/// 3. a process still without a thread takes the most recently updated thread anywhere that has
+///    been touched since the process started: a session resumed from another directory.
+fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> HashMap<u32, String> {
+    let mut processes = processes.to_vec();
+    processes.sort_by_key(|process| (process.started_at, process.pid));
+    let interactive = threads
         .iter()
-        .filter(|thread| Path::new(&thread.cwd) == cwd)
+        .filter(|thread| thread.interactive())
         .collect::<Vec<_>>();
-    let started_with_process = in_directory
-        .iter()
-        .filter(|thread| {
-            thread.created_at.is_some_and(|created_at| {
-                (created_at - started_at).abs() <= CODEX_START_TOLERANCE_SECONDS
+    let mut claims = Claims::default();
+
+    for process in &processes {
+        let fresh = interactive
+            .iter()
+            .filter(|thread| {
+                claims.is_free(thread)
+                    && thread.cwd() == process.cwd
+                    && thread.created_at.is_some_and(|created_at| {
+                        (created_at - process.started_at).abs() <= CODEX_START_TOLERANCE_SECONDS
+                    })
             })
-        })
-        .collect::<Vec<_>>();
-    if let [thread] = started_with_process.as_slice() {
-        return Some(thread.id.clone());
+            .collect::<Vec<_>>();
+        if let [thread] = fresh.as_slice() {
+            claims.claim(process.pid, thread);
+        }
     }
-    let active = in_directory
+
+    let mut by_directory = BTreeMap::<&Path, Vec<&CodexProcess>>::new();
+    for process in processes.iter().filter(|process| !claims.has(process.pid)) {
+        by_directory.entry(process.cwd.as_path()).or_default().push(process);
+    }
+    for (directory, group) in by_directory {
+        let earliest = group[0].started_at;
+        let mut candidates = interactive
+            .iter()
+            .filter(|thread| {
+                claims.is_free(thread) && thread.cwd() == directory && thread.updated_since(earliest)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
+        candidates.truncate(group.len());
+        candidates.sort_by_key(|thread| thread.created_at);
+        for (process, thread) in group.iter().zip(candidates) {
+            claims.claim(process.pid, thread);
+        }
+    }
+
+    let leftovers = processes
         .iter()
-        .filter(|thread| {
-            tui_thread(thread)
-                && thread
-                    .updated_at
-                    .is_some_and(|updated_at| updated_at >= started_at)
-        })
+        .filter(|process| !claims.has(process.pid))
         .collect::<Vec<_>>();
-    match active.as_slice() {
-        [thread] => Some(thread.id.clone()),
-        _ => None,
+    for process in leftovers {
+        let newest = interactive
+            .iter()
+            .filter(|thread| claims.is_free(thread) && thread.updated_since(process.started_at))
+            .max_by_key(|thread| thread.updated_at)
+            .copied();
+        if let Some(thread) = newest {
+            claims.claim(process.pid, thread);
+        }
     }
+    claims.assigned
 }
 
-fn tui_thread(thread: &CodexThread) -> bool {
-    thread
-        .originator
-        .as_deref()
-        .is_none_or(|originator| originator.is_empty() || originator == "codex-tui")
+/// Which process took which thread, and which threads are still free.
+#[derive(Default)]
+struct Claims<'a> {
+    claimed: HashSet<&'a str>,
+    assigned: HashMap<u32, String>,
+}
+
+impl<'a> Claims<'a> {
+    fn is_free(&self, thread: &CodexThread) -> bool {
+        !self.claimed.contains(thread.id.as_str())
+    }
+
+    fn has(&self, pid: u32) -> bool {
+        self.assigned.contains_key(&pid)
+    }
+
+    fn claim(&mut self, pid: u32, thread: &'a CodexThread) {
+        if self.claimed.insert(thread.id.as_str()) {
+            self.assigned.insert(pid, thread.id.clone());
+        }
+    }
 }
 
 fn process_started_at(pid: u32) -> Option<i64> {
@@ -737,33 +869,96 @@ mod tests {
         assert_eq!(ids, vec![Some(CLAUDE_ID.into()), None, None, None, None]);
     }
 
+    fn thread(id: &str, cwd: &str, created_at: i64, updated_at: i64, source: &str) -> CodexThread {
+        CodexThread {
+            id: id.into(),
+            cwd: cwd.into(),
+            created_at: Some(created_at),
+            updated_at: Some(updated_at),
+            originator: Some("codex-tui".into()),
+            source: Some(source.into()),
+        }
+    }
+
+    fn process(pid: u32, cwd: &str, started_at: i64) -> CodexProcess {
+        CodexProcess {
+            pid,
+            cwd: cwd.into(),
+            started_at,
+        }
+    }
+
     #[test]
-    fn selects_codex_threads_from_query_output() {
-        let cwd = Path::new("/Users/me/project");
+    fn parses_codex_threads_from_query_output() {
         let rows = format!(
-            r#"[{{"id":"{CODEX_ID}","cwd":"/Users/me/project","created_at":1001,"updated_at":5000,"originator":"codex-tui"}},
-                {{"id":"resumed","cwd":"/Users/me/project","created_at":100,"updated_at":5000,"originator":null}},
-                {{"id":"stale","cwd":"/Users/me/project","created_at":200,"updated_at":900,"originator":"codex-tui"}},
-                {{"id":"ide","cwd":"/Users/me/project","created_at":300,"updated_at":6000,"originator":"vscode"}},
-                {{"id":"elsewhere","cwd":"/Users/me/other","created_at":1000,"updated_at":7000,"originator":"codex-tui"}}]"#
+            r#"[{{"id":"{CODEX_ID}","cwd":"/Users/me/project","created_at":1001,"updated_at":5000,"originator":"codex-tui","source":"cli"}},
+                {{"id":"sub","cwd":"/Users/me/project","created_at":100,"updated_at":5000,"originator":null,"source":"{{\"subagent\":{{}}}}"}}]"#
         );
         let threads = parse_codex_threads(&rows).unwrap();
-        assert_eq!(threads.len(), 5);
+        assert_eq!(threads.len(), 2);
+        assert!(threads[0].interactive());
+        assert!(!threads[1].interactive());
         assert!(parse_codex_threads(" \n").unwrap().is_empty());
         assert!(parse_codex_threads("Error: unable to open database").is_none());
-        assert_eq!(
-            select_codex_thread(&threads, cwd, 1_000).as_deref(),
-            Some(CODEX_ID)
-        );
-        assert_eq!(
-            select_codex_thread(&threads[1..], cwd, 1_000).as_deref(),
-            Some("resumed")
-        );
-        assert_eq!(select_codex_thread(&threads[..2], cwd, 2_000), None);
         assert_eq!(
             parse_elapsed_seconds("03-07:25:55"),
             Some(3 * 86_400 + 7 * 3_600 + 25 * 60 + 55)
         );
+    }
+
+    #[test]
+    fn assigns_fresh_sessions_by_start_time() {
+        let threads = vec![
+            thread("fresh", "/p", 1_003, 1_003, "cli"),
+            thread("older", "/p", 100, 9_000, "cli"),
+        ];
+        let assigned = assign_codex_threads(&[process(1, "/p", 1_000)], &threads);
+        assert_eq!(assigned.get(&1).map(String::as_str), Some("fresh"));
+    }
+
+    #[test]
+    fn pairs_resumed_sessions_in_one_directory_in_start_order() {
+        let threads = vec![
+            thread("first", "/p", 900, 9_000, "vscode"),
+            thread("second", "/p", 4_500, 9_500, "vscode"),
+            thread("subagent", "/p", 4_600, 9_999, r#"{"subagent":{}}"#),
+            thread("exec", "/p", 4_700, 9_999, "exec"),
+            thread("stale", "/p", 50, 500, "cli"),
+        ];
+        let processes = [process(2, "/p", 5_000), process(1, "/p", 1_000)];
+        let assigned = assign_codex_threads(&processes, &threads);
+        assert_eq!(assigned.get(&1).map(String::as_str), Some("first"));
+        assert_eq!(assigned.get(&2).map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn leftover_takes_the_newest_thread_touched_since_it_started() {
+        let threads = vec![
+            thread("elsewhere", "/elsewhere", 2_000, 8_000, "vscode"),
+            thread("newer", "/x", 2_500, 8_500, "cli"),
+            thread("before-start", "/y", 100, 2_500, "cli"),
+        ];
+        let processes = [process(3, "/home", 3_000), process(4, "/none", 9_999)];
+        let assigned = assign_codex_threads(&processes, &threads);
+        assert_eq!(assigned.get(&3).map(String::as_str), Some("newer"));
+        assert_eq!(assigned.get(&4), None);
+    }
+
+    #[test]
+    fn two_processes_never_share_a_thread() {
+        let threads = vec![thread("only", "/p", 100, 9_000, "cli")];
+        let processes = [process(1, "/p", 1_000), process(2, "/p", 2_000)];
+        let assigned = assign_codex_threads(&processes, &threads);
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned.get(&1).map(String::as_str), Some("only"));
+    }
+
+    #[test]
+    fn reads_the_cd_argument() {
+        assert_eq!(codex_cd_argument("codex -C /tmp/x"), Some(PathBuf::from("/tmp/x")));
+        assert_eq!(codex_cd_argument("codex --cd=/y/z resume"), Some(PathBuf::from("/y/z")));
+        assert_eq!(codex_cd_argument(r#"codex --cd "/a b""#), Some(PathBuf::from("/a b")));
+        assert_eq!(codex_cd_argument("codex resume"), None);
     }
 
     #[test]

@@ -55,7 +55,7 @@ const CODEX_START_TOLERANCE_SECONDS: i64 = 10;
 pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
     let output = command::run("ps", &["-axo", "pid=,ppid=,tty=,command="])?;
     let codex_threads = codex_assignments(home, &parse_processes(&output), process_cwd);
-    Ok(discover_sessions(
+    let mut sessions = discover_sessions(
         &output,
         process_cwd,
         |pid, agent, command, _| match agent {
@@ -63,7 +63,7 @@ pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
                 .captures(command)
                 .and_then(|captures| captures.get(1))
                 .map(|id| id.as_str().to_owned())
-                .or_else(|| codex_threads.get(&pid).cloned())
+                .or_else(|| codex_threads.get(&pid).map(|thread| thread.id.clone()))
                 .or_else(|| newest_open_codex_session(pid)),
             Agent::Amp => AMP_THREAD_PATTERN
                 .find(command)
@@ -71,7 +71,15 @@ pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
                 .or_else(|| open_amp_thread(pid)),
             Agent::Claude => claude_session_for_process(home, pid),
         },
-    ))
+    );
+    // A thread resumed from another directory is attached by that directory's name in the terminal
+    // title, not by the shell's directory, so the session carries the thread's directory.
+    for session in &mut sessions {
+        if let Some(directory) = codex_threads.get(&session.pid).and_then(|thread| thread.directory.clone()) {
+            session.cwd = directory;
+        }
+    }
+    Ok(sessions)
 }
 
 fn discover_sessions(
@@ -294,6 +302,14 @@ impl CodexThread {
     }
 }
 
+/// The thread a running Codex TUI was matched with; `directory` is set when the match crossed
+/// directories and the thread's own directory must be used to find its terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexMatch {
+    id: String,
+    directory: Option<PathBuf>,
+}
+
 /// A running Codex TUI whose thread id is not on its command line.
 #[derive(Debug, Clone)]
 struct CodexProcess {
@@ -308,7 +324,7 @@ fn codex_assignments(
     home: &Path,
     processes: &[Process],
     mut cwd_for_pid: impl FnMut(u32) -> Option<PathBuf>,
-) -> HashMap<u32, String> {
+) -> HashMap<u32, CodexMatch> {
     let attached = ghostty_attached(processes)
         .into_iter()
         .filter(|process| codex_process(&process.command))
@@ -399,7 +415,7 @@ fn parse_codex_threads(output: &str) -> Option<Vec<CodexThread>> {
 ///    creation order: resumed sessions sharing a directory;
 /// 3. a process still without a thread takes the most recently updated thread anywhere that has
 ///    been touched since the process started: a session resumed from another directory.
-fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> HashMap<u32, String> {
+fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> HashMap<u32, CodexMatch> {
     let mut processes = processes.to_vec();
     processes.sort_by_key(|process| (process.started_at, process.pid));
     let interactive = threads
@@ -420,7 +436,7 @@ fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> 
             })
             .collect::<Vec<_>>();
         if let [thread] = fresh.as_slice() {
-            claims.claim(process.pid, thread);
+            claims.claim(process.pid, thread, false);
         }
     }
 
@@ -441,7 +457,7 @@ fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> 
         candidates.truncate(group.len());
         candidates.sort_by_key(|thread| thread.created_at);
         for (process, thread) in group.iter().zip(candidates) {
-            claims.claim(process.pid, thread);
+            claims.claim(process.pid, thread, false);
         }
     }
 
@@ -456,7 +472,7 @@ fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> 
             .max_by_key(|thread| thread.updated_at)
             .copied();
         if let Some(thread) = newest {
-            claims.claim(process.pid, thread);
+            claims.claim(process.pid, thread, true);
         }
     }
     claims.assigned
@@ -466,7 +482,7 @@ fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> 
 #[derive(Default)]
 struct Claims<'a> {
     claimed: HashSet<&'a str>,
-    assigned: HashMap<u32, String>,
+    assigned: HashMap<u32, CodexMatch>,
 }
 
 impl<'a> Claims<'a> {
@@ -478,9 +494,10 @@ impl<'a> Claims<'a> {
         self.assigned.contains_key(&pid)
     }
 
-    fn claim(&mut self, pid: u32, thread: &'a CodexThread) {
+    fn claim(&mut self, pid: u32, thread: &'a CodexThread, crossed_directories: bool) {
         if self.claimed.insert(thread.id.as_str()) {
-            self.assigned.insert(pid, thread.id.clone());
+            let directory = crossed_directories.then(|| thread.cwd().to_path_buf());
+            self.assigned.insert(pid, CodexMatch { id: thread.id.clone(), directory });
         }
     }
 }
@@ -583,8 +600,11 @@ pub fn assign_sessions(
             .iter()
             .filter(|row| {
                 !assignments.contains_key(&row.terminal_id)
-                    && row.working_directory.as_os_str().is_empty()
-                    && title_matches_cwd(&row.terminal_name, &cwd, agent)
+                    && if row.working_directory.as_os_str().is_empty() {
+                        title_matches_cwd(&row.terminal_name, &cwd, agent)
+                    } else {
+                        title_names_directory(&row.terminal_name, &cwd)
+                    }
             })
             .collect::<Vec<_>>();
         if candidates.len() == 1 {
@@ -712,6 +732,13 @@ fn historical_terminal_names(
         }
     }
     names
+}
+
+/// The terminal title is exactly the directory's name, as Codex sets it for the thread it runs.
+fn title_names_directory(title: &str, cwd: &Path) -> bool {
+    cwd.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|basename| title.trim() == basename)
 }
 
 fn title_matches_cwd(title: &str, cwd: &Path, agent: Agent) -> bool {
@@ -924,7 +951,8 @@ mod tests {
             thread("older", "/p", 100, 9_000, "cli"),
         ];
         let assigned = assign_codex_threads(&[process(1, "/p", 1_000)], &threads);
-        assert_eq!(assigned.get(&1).map(String::as_str), Some("fresh"));
+        assert_eq!(assigned.get(&1).map(|m| m.id.as_str()), Some("fresh"));
+        assert_eq!(assigned.get(&1).and_then(|m| m.directory.clone()), None);
     }
 
     #[test]
@@ -938,8 +966,8 @@ mod tests {
         ];
         let processes = [process(2, "/p", 5_000), process(1, "/p", 1_000)];
         let assigned = assign_codex_threads(&processes, &threads);
-        assert_eq!(assigned.get(&1).map(String::as_str), Some("first"));
-        assert_eq!(assigned.get(&2).map(String::as_str), Some("second"));
+        assert_eq!(assigned.get(&1).map(|m| m.id.as_str()), Some("first"));
+        assert_eq!(assigned.get(&2).map(|m| m.id.as_str()), Some("second"));
     }
 
     #[test]
@@ -951,7 +979,10 @@ mod tests {
         ];
         let processes = [process(3, "/home", 3_000), process(4, "/none", 9_999)];
         let assigned = assign_codex_threads(&processes, &threads);
-        assert_eq!(assigned.get(&3).map(String::as_str), Some("newer"));
+        assert_eq!(
+            assigned.get(&3),
+            Some(&CodexMatch { id: "newer".into(), directory: Some("/x".into()) })
+        );
         assert_eq!(assigned.get(&4), None);
     }
 
@@ -961,7 +992,7 @@ mod tests {
         let processes = [process(1, "/p", 1_000), process(2, "/p", 2_000)];
         let assigned = assign_codex_threads(&processes, &threads);
         assert_eq!(assigned.len(), 1);
-        assert_eq!(assigned.get(&1).map(String::as_str), Some("only"));
+        assert_eq!(assigned.get(&1).map(|m| m.id.as_str()), Some("only"));
     }
 
     #[test]
@@ -978,7 +1009,22 @@ mod tests {
             .filter(|thread| !reserved.contains(&thread.id.to_lowercase()))
             .collect::<Vec<_>>();
         let assigned = assign_codex_threads(&[process(7, "/home", 1_000)], &offered);
-        assert_eq!(assigned.get(&7).map(String::as_str), Some("other"));
+        assert_eq!(assigned.get(&7).map(|m| m.id.as_str()), Some("other"));
+    }
+
+    #[test]
+    fn a_session_resumed_from_elsewhere_attaches_only_to_a_terminal_titled_with_its_directory() {
+        let snapshots = TempDir::new().unwrap();
+        let scraper = session(Agent::Codex, "ttys000", "/Users/me/work/scraper", CODEX_ID);
+        let rows = vec![row("home-shell", "marian", "/Users/me"), row("scraper-tab", "scraper", "/Users/me")];
+        let (assigned, _) = assign_sessions(&rows, &[scraper.clone()], snapshots.path(), false);
+        assert_eq!(assigned.get("scraper-tab").map(|s| s.session_id.as_str()), Some(CODEX_ID));
+        assert!(!assigned.contains_key("home-shell"));
+
+        let fresh_but_misattributed = session(Agent::Codex, "ttys001", "/Users/me/work/fws-cms", "wrong");
+        let rows = vec![row("home-shell", "marian", "/Users/me")];
+        let (assigned, _) = assign_sessions(&rows, &[fresh_but_misattributed], snapshots.path(), false);
+        assert!(assigned.is_empty());
     }
 
     #[test]

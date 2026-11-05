@@ -79,8 +79,14 @@ still running during an additive restore, `rz` opens a plain shell instead of
 starting a duplicate.
 
 Only interactive terminal CLIs are detected. Codex conversations are looked up in
-`~/.codex/state_*.sqlite` by working directory and start time, with the older
-open rollout file as a fallback. Claude Code sessions come from
+`~/.codex/state_*.sqlite` and matched to the running TUIs as a set: a thread
+created when the process started, then per directory in start order against the
+most recently updated threads, then, for a session resumed from another
+directory, the newest thread touched since the process started, which is only
+attached to a terminal whose title is that thread's directory name. Subagent and
+`codex exec` threads are skipped, a thread named on a command line (`codex resume
+<id>`) is reserved for that process, and `-C` is honoured. The older open rollout
+file remains a fallback. Claude Code sessions come from
 `~/.claude/sessions/<pid>.json`; background sessions and sessions started by an
 IDE or the SDK are ignored.
 

@@ -472,16 +472,15 @@ fn restore_command(
         }
     }
     match terminal.session() {
-        Some(session) if !running_sessions.contains(&session.key()) => match session.agent {
-            Agent::Amp => commands.push(format!(
-                "exec amp threads continue {}",
-                shell_quote(session.id)
-            )),
-            Agent::Claude => {
-                commands.push(format!("exec claude --resume {}", shell_quote(session.id)))
-            }
-            Agent::Codex => commands.push(format!("exec codex resume {}", shell_quote(session.id))),
-        },
+        Some(session) if !running_sessions.contains(&session.key()) => {
+            let binary = shell_word(&agent_binary(session.agent));
+            let id = shell_quote(session.id);
+            commands.push(match session.agent {
+                Agent::Amp => format!("exec {binary} threads continue {id}"),
+                Agent::Claude => format!("exec {binary} --resume {id}"),
+                Agent::Codex => format!("exec {binary} resume {id}"),
+            });
+        }
         Some(session) => {
             duplicates.push(session.key());
             commands.push(format!(
@@ -495,6 +494,35 @@ fn restore_command(
         None => commands.push("exec /bin/zsh -l".into()),
     }
     format!("/bin/zsh -lc {}", shell_quote(&commands.join("; ")))
+}
+
+/// The program used to resume an agent inside the restored terminal.
+///
+/// Ghostty runs the restore command through `/bin/zsh -lc`, a login shell that
+/// does not read `~/.zshrc`. Agents installed under `~/.local/bin` or similar
+/// user directories are often only added to `PATH` there, so a bare `claude`
+/// fails with "command not found" even though it works at the user's prompt.
+/// `rz` itself runs from that prompt, so resolve the binary on its own `PATH`
+/// and hand the absolute path to the restored shell. Fall back to the bare
+/// name when nothing is found, which keeps the original error message.
+fn agent_binary(agent: Agent) -> String {
+    let name = agent.to_string();
+    std::env::var_os("PATH")
+        .and_then(|path| find_executable(&name, &path))
+        .map_or(name, |binary| binary.to_string_lossy().into_owned())
+}
+
+fn find_executable(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::env::split_paths(path)
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
 
 fn working_directory_report_command(cwd: &Path) -> String {
@@ -570,6 +598,20 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Quote a word only when it contains characters the shell would interpret, so
+/// plain names and paths stay readable in the generated command.
+fn shell_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '@'));
+    if plain {
+        value.into()
+    } else {
+        shell_quote(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +655,7 @@ mod tests {
             Path::new("/Users/me/project"),
             None,
         );
-        assert!(command.contains("exec amp threads continue"));
+        assert!(command.contains("amp threads continue"));
         assert!(duplicates.is_empty());
 
         let running = HashSet::from([terminal.session().unwrap().key()]);
@@ -626,7 +668,7 @@ mod tests {
             None,
         );
         assert!(command.contains("Amp thread already running"));
-        assert!(!command.contains("exec amp threads continue"));
+        assert!(!command.contains("amp threads continue"));
         assert_eq!(duplicates.len(), 1);
     }
 
@@ -643,8 +685,51 @@ mod tests {
             Path::new("/Users/me/project"),
             None,
         );
-        assert!(command.contains("exec claude --resume"));
+        assert!(command.contains("claude --resume"));
         assert!(command.contains("b1fa0daa-ce10-446e-9648-e838f1b192b2"));
+    }
+
+    #[test]
+    fn resolves_agent_binaries_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("rz-path-{}", std::process::id()));
+        let empty = root.join("empty");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(bin.join("codex"), "not executable").unwrap();
+
+        let path = std::env::join_paths([empty.as_path(), bin.as_path()]).unwrap();
+        assert_eq!(find_executable("claude", &path), Some(claude));
+        assert_eq!(find_executable("codex", &path), None);
+        assert_eq!(find_executable("amp", &path), None);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_the_bare_agent_name() {
+        assert_eq!(find_executable("claude", std::ffi::OsStr::new("")), None);
+        let binary = agent_binary(Agent::Claude);
+        assert!(binary == "claude" || binary.ends_with("/claude"));
+    }
+
+    #[test]
+    fn shell_word_quotes_only_when_needed() {
+        assert_eq!(shell_word("claude"), "claude");
+        assert_eq!(
+            shell_word("/Users/me/.local/bin/claude"),
+            "/Users/me/.local/bin/claude"
+        );
+        assert_eq!(
+            shell_word("/Users/me/My Tools/claude"),
+            "'/Users/me/My Tools/claude'"
+        );
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]

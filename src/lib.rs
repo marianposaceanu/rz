@@ -4,6 +4,7 @@ mod cli;
 mod command;
 mod ghostty;
 mod model;
+mod pi;
 mod ui;
 mod watch;
 

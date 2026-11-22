@@ -13,6 +13,7 @@ pub const USAGE: &str = "Usage:
   rz --session NAME_OR_TIMESTAMP [--keep-existing] [--dry-run]
   rz --dry-run [--keep-existing]
   rz --list [NUMBER]
+  rz --install-pi-extension
   rz --version";
 
 const MINIMUM_WATCH_INTERVAL: u64 = 10;
@@ -28,6 +29,7 @@ pub enum Command {
     WatchStatus,
     WatchStop,
     WatchWorker(WorkerOptions),
+    InstallPiExtension,
     Help,
     Version,
 }
@@ -89,6 +91,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         Some("--watch-worker") => parse_worker(&args[1..]).map(Command::WatchWorker),
         Some("--clean") => parse_clean(&args[1..]),
         Some("--list") => parse_list(&args[1..]).map(Command::List),
+        Some("--install-pi-extension") if args.len() == 1 => Ok(Command::InstallPiExtension),
         Some("--help") if args.len() == 1 => Ok(Command::Help),
         Some("--version" | "-V") if args.len() == 1 => Ok(Command::Version),
         _ => parse_restore(&args).map(Command::Restore),

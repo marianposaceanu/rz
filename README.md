@@ -3,7 +3,7 @@
 `rz` saves and restores native [Ghostty](https://ghostty.org/) workspaces on
 macOS. A snapshot records windows, tabs, terminal surfaces, working directories,
 focus, window geometry, non-empty scrollback, Codex conversation IDs, Amp thread
-IDs, and Claude Code session IDs.
+IDs, Claude Code session IDs, and Pi sessions.
 
 `rz` is a small native executable written in Rust. Snapshots created by the
 earlier Ruby releases remain fully compatible.
@@ -71,10 +71,11 @@ window by default; pass `--all-windows` to save the complete app.
 Snapshots and watcher state live under
 `~/.local/state/ghostty-rz`. Override that location with `RZ_STATE_DIR`.
 
-When a terminal is running Codex, [Amp](https://ampcode.com/), or Claude Code,
+When a terminal is running Codex, [Amp](https://ampcode.com/), Claude Code, or [Pi](https://pi.dev/),
 `rz` associates the process with that exact Ghostty terminal. Restore uses
 `codex resume` for a Codex conversation, `amp threads continue` for an Amp
-thread, and `claude --resume` for a Claude Code session. If the same session is
+thread, `claude --resume` for a Claude Code session, and `pi --session` with the
+exact saved session file for Pi. If the same session is
 still running during an additive restore, `rz` opens a plain shell instead of
 starting a duplicate.
 
@@ -90,12 +91,39 @@ file remains a fallback. Claude Code sessions come from
 `~/.claude/sessions/<pid>.json`; background sessions and sessions started by an
 IDE or the SDK are ignored.
 
+### Pi sessions
+
+Install the bundled Pi extension once:
+
+```sh
+rz --install-pi-extension
+```
+
+Run `/reload` in already-open Pi terminals, or restart Pi. Then save and restore
+workspaces with the usual `rz` commands. Run the installer again after an `rz`
+upgrade to update the extension.
+
+Pi replaces its process command line and does not keep its session file open, so
+the extension records the active session file, ID, working directory, and process
+start time under `~/.pi/agent/rz-sessions/`. It updates the mapping when sessions
+start, switch, fork, or reload, and removes it on shutdown. `PI_CODING_AGENT_DIR`
+overrides the Pi configuration directory for both the installer and session lookup.
+
+`rz` matches each Pi process to its Ghostty terminal by TTY, so identical titles
+and multiple sessions in one directory are supported. Pi support requires a
+Ghostty version exposing terminal TTYs through AppleScript. Custom session IDs
+and storage directories work because restore uses the exact file path. Ephemeral
+(`--no-session`), noninteractive, and RPC sessions are not resumed. The original
+Pi session files must remain available; snapshots do not copy conversations.
+If a Pi session cannot be identified, the snapshot includes a warning instead of
+guessing a conversation.
+
 ## Limits
 
 Ghostty exposes terminal surfaces but not its split tree or pane proportions, so
 additional surfaces restore as right-hand splits. Scrollback is replayed as text,
 not as a running process. `rz` can resume detected Codex conversations, Amp
-threads, and Claude Code sessions by their exact IDs, but it cannot reconstruct
+threads, Claude Code sessions, and tracked Pi sessions, but it cannot reconstruct
 arbitrary programs. A Codex conversation resumed through the picker is only
 recognised once it has received a message, and when several conversations in
 one directory are active at the same time none of them is guessed.
@@ -108,6 +136,7 @@ Build and test from source with a recent Rust toolchain:
 cargo build --release
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+node --test test/pi-session-tracker.test.mjs
 ```
 
 ## License

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::{
     command,
     model::{Agent, AgentSession, CaptureRow, SessionKey, Snapshot},
+    pi,
 };
 
 static PROCESS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -27,7 +28,8 @@ static CODEX_RESUME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid Codex resume regex")
 });
 static CODEX_CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|\s)(?:-C|--cd)(?:=|\s+)("[^"]+"|'[^']+'|\S+)"#).expect("valid Codex cd regex")
+    Regex::new(r#"(?:^|\s)(?:-C|--cd)(?:=|\s+)("[^"]+"|'[^']+'|\S+)"#)
+        .expect("valid Codex cd regex")
 });
 static AMP_THREAD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"(?i)T-{}", UUID_PATTERN.as_str())).expect("valid Amp thread regex")
@@ -52,12 +54,41 @@ struct Process {
 
 const CODEX_START_TOLERANCE_SECONDS: i64 = 10;
 
-pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
+pub fn running_sessions(
+    home: &Path,
+    warning_ttys: Option<&HashSet<String>>,
+) -> Result<(Vec<AgentSession>, Vec<String>)> {
     let output = command::run("ps", &["-axo", "pid=,ppid=,tty=,command="])?;
-    let codex_threads = codex_assignments(home, &parse_processes(&output), process_cwd);
+    let processes = parse_processes(&output);
+    let codex_threads = codex_assignments(home, &processes, process_cwd);
+    let mut pi_sessions = HashMap::new();
+    let mut warnings = Vec::new();
+    let agent_dir = pi::config_dir(home);
+    for process in ghostty_attached(&processes)
+        .into_iter()
+        .filter(|process| executable_named(&process.command, "pi"))
+    {
+        match process_started_at(process.pid)
+            .and_then(|started_at| pi::session_for_process(&agent_dir, process.pid, started_at))
+        {
+            Some(session) => {
+                pi_sessions.insert(process.pid, session);
+            }
+            None if warning_ttys.is_none_or(|ttys| ttys.contains(&process.tty)) => warnings.push(format!(
+                "Pi on {} has no saved session mapping; run rz --install-pi-extension and /reload in Pi. Only persisted sessions can resume.",
+                process.tty
+            )),
+            None => {}
+        }
+    }
     let mut sessions = discover_sessions(
         &output,
-        process_cwd,
+        |pid| {
+            pi_sessions
+                .get(&pid)
+                .map(|session| session.cwd.clone())
+                .or_else(|| process_cwd(pid))
+        },
         |pid, agent, command, _| match agent {
             Agent::Codex => CODEX_RESUME_PATTERN
                 .captures(command)
@@ -70,16 +101,25 @@ pub fn running_sessions(home: &Path) -> Result<Vec<AgentSession>> {
                 .map(|id| id.as_str().to_owned())
                 .or_else(|| open_amp_thread(pid)),
             Agent::Claude => claude_session_for_process(home, pid),
+            Agent::Pi => pi_sessions
+                .get(&pid)
+                .map(|session| session.session_id.clone()),
         },
     );
     // A thread resumed from another directory is attached by that directory's name in the terminal
     // title, not by the shell's directory, so the session carries the thread's directory.
     for session in &mut sessions {
-        if let Some(directory) = codex_threads.get(&session.pid).and_then(|thread| thread.directory.clone()) {
+        if let Some(directory) = codex_threads
+            .get(&session.pid)
+            .and_then(|thread| thread.directory.clone())
+        {
             session.cwd = directory;
         }
+        if let Some(tracked) = pi_sessions.get(&session.pid) {
+            session.session_file = Some(tracked.session_file.clone());
+        }
     }
-    Ok(sessions)
+    Ok((sessions, warnings))
 }
 
 fn discover_sessions(
@@ -97,6 +137,8 @@ fn discover_sessions(
                 Agent::Amp
             } else if claude_process(&process.command) {
                 Agent::Claude
+            } else if executable_named(&process.command, "pi") {
+                Agent::Pi
             } else {
                 return None;
             };
@@ -109,6 +151,7 @@ fn discover_sessions(
                 cwd,
                 session_id,
                 command: process.command.clone(),
+                session_file: None,
             })
         })
         .collect()
@@ -298,7 +341,8 @@ impl CodexThread {
     }
 
     fn updated_since(&self, moment: i64) -> bool {
-        self.updated_at.is_some_and(|updated_at| updated_at >= moment)
+        self.updated_at
+            .is_some_and(|updated_at| updated_at >= moment)
     }
 }
 
@@ -415,7 +459,10 @@ fn parse_codex_threads(output: &str) -> Option<Vec<CodexThread>> {
 ///    creation order: resumed sessions sharing a directory;
 /// 3. a process still without a thread takes the most recently updated thread anywhere that has
 ///    been touched since the process started: a session resumed from another directory.
-fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> HashMap<u32, CodexMatch> {
+fn assign_codex_threads(
+    processes: &[CodexProcess],
+    threads: &[CodexThread],
+) -> HashMap<u32, CodexMatch> {
     let mut processes = processes.to_vec();
     processes.sort_by_key(|process| (process.started_at, process.pid));
     let interactive = threads
@@ -442,14 +489,19 @@ fn assign_codex_threads(processes: &[CodexProcess], threads: &[CodexThread]) -> 
 
     let mut by_directory = BTreeMap::<&Path, Vec<&CodexProcess>>::new();
     for process in processes.iter().filter(|process| !claims.has(process.pid)) {
-        by_directory.entry(process.cwd.as_path()).or_default().push(process);
+        by_directory
+            .entry(process.cwd.as_path())
+            .or_default()
+            .push(process);
     }
     for (directory, group) in by_directory {
         let earliest = group[0].started_at;
         let mut candidates = interactive
             .iter()
             .filter(|thread| {
-                claims.is_free(thread) && thread.cwd() == directory && thread.updated_since(earliest)
+                claims.is_free(thread)
+                    && thread.cwd() == directory
+                    && thread.updated_since(earliest)
             })
             .copied()
             .collect::<Vec<_>>();
@@ -497,7 +549,13 @@ impl<'a> Claims<'a> {
     fn claim(&mut self, pid: u32, thread: &'a CodexThread, crossed_directories: bool) {
         if self.claimed.insert(thread.id.as_str()) {
             let directory = crossed_directories.then(|| thread.cwd().to_path_buf());
-            self.assigned.insert(pid, CodexMatch { id: thread.id.clone(), directory });
+            self.assigned.insert(
+                pid,
+                CodexMatch {
+                    id: thread.id.clone(),
+                    directory,
+                },
+            );
         }
     }
 }
@@ -535,7 +593,25 @@ pub fn assign_sessions(
     let mut assignments = HashMap::new();
     let mut remaining = sessions.to_vec();
 
-    let mut ordered = sessions.to_vec();
+    for row in rows.iter().filter(|row| !row.tty.is_empty()) {
+        let candidates = remaining
+            .iter()
+            .filter(|session| {
+                session.agent == Agent::Pi && session.tty == row.tty.trim_start_matches("/dev/")
+            })
+            .collect::<Vec<_>>();
+        if let [session] = candidates.as_slice() {
+            let session = (*session).clone();
+            assignments.insert(row.terminal_id.clone(), session.clone());
+            remove_session(&mut remaining, &session.key());
+        }
+    }
+
+    let mut ordered = remaining
+        .iter()
+        .filter(|session| session.agent != Agent::Pi)
+        .cloned()
+        .collect::<Vec<_>>();
     ordered.sort_by_key(|session| (session.agent, tty_number(&session.tty)));
     for session in ordered {
         let candidate = rows.iter().find(|row| {
@@ -551,12 +627,13 @@ pub fn assign_sessions(
 
     let directories = remaining
         .iter()
+        .filter(|session| session.agent != Agent::Pi)
         .map(|session| session.cwd.clone())
         .collect::<BTreeSet<_>>();
     for cwd in directories {
         let mut cwd_sessions = remaining
             .iter()
-            .filter(|session| session.cwd == cwd)
+            .filter(|session| session.cwd == cwd && session.agent != Agent::Pi)
             .cloned()
             .collect::<Vec<_>>();
         if cwd_sessions
@@ -585,6 +662,7 @@ pub fn assign_sessions(
 
     let groups = remaining
         .iter()
+        .filter(|session| session.agent != Agent::Pi)
         .map(|session| (session.agent, session.cwd.clone()))
         .collect::<BTreeSet<_>>();
     for (agent, cwd) in groups {
@@ -616,6 +694,9 @@ pub fn assign_sessions(
 
     let historical_names = historical_terminal_names(&remaining, snapshots_dir);
     for session in remaining.clone() {
+        if session.agent == Agent::Pi {
+            continue;
+        }
         let Some(previous_name) = historical_names.get(&session.key()) else {
             continue;
         };
@@ -646,7 +727,10 @@ pub fn assign_sessions(
                     && title_matches_cwd(&row.terminal_name, &session.cwd, session.agent)
             })
             .collect::<Vec<_>>();
-        if !warn_for_all_sessions && title_candidates.is_empty() {
+        let tty_matches = rows
+            .iter()
+            .any(|row| row.tty.trim_start_matches("/dev/") == session.tty);
+        if !warn_for_all_sessions && title_candidates.is_empty() && !tty_matches {
             continue;
         }
         let exact_cwd_exists = available
@@ -655,7 +739,9 @@ pub fn assign_sessions(
         let ambiguous_agents = remaining.iter().any(|other| {
             other.key() != session.key() && other.cwd == session.cwd && other.agent != session.agent
         });
-        let reason = if ambiguous_agents && exact_cwd_exists {
+        let reason = if session.agent == Agent::Pi {
+            "Ghostty did not expose a unique matching TTY; Pi requires Ghostty terminal TTY support"
+        } else if ambiguous_agents && exact_cwd_exists {
             "multiple agent types share this directory and terminal titles do not identify them"
         } else if title_candidates.len() > 1 {
             "multiple blank-directory Ghostty terminals have matching project titles"
@@ -846,6 +932,7 @@ mod tests {
             cwd: cwd.into(),
             session_id: id.into(),
             command: agent.to_string(),
+            session_file: None,
         }
     }
 
@@ -864,6 +951,7 @@ mod tests {
             tab_selected: true,
             terminal_index: 1,
             terminal_id: id.into(),
+            tty: String::new(),
             terminal_name: title.into(),
             terminal_focused: true,
             working_directory: cwd.into(),
@@ -981,7 +1069,10 @@ mod tests {
         let assigned = assign_codex_threads(&processes, &threads);
         assert_eq!(
             assigned.get(&3),
-            Some(&CodexMatch { id: "newer".into(), directory: Some("/x".into()) })
+            Some(&CodexMatch {
+                id: "newer".into(),
+                directory: Some("/x".into())
+            })
         );
         assert_eq!(assigned.get(&4), None);
     }
@@ -1016,23 +1107,85 @@ mod tests {
     fn a_session_resumed_from_elsewhere_attaches_only_to_a_terminal_titled_with_its_directory() {
         let snapshots = TempDir::new().unwrap();
         let scraper = session(Agent::Codex, "ttys000", "/Users/me/work/scraper", CODEX_ID);
-        let rows = vec![row("home-shell", "marian", "/Users/me"), row("scraper-tab", "scraper", "/Users/me")];
-        let (assigned, _) = assign_sessions(&rows, std::slice::from_ref(&scraper), snapshots.path(), false);
-        assert_eq!(assigned.get("scraper-tab").map(|s| s.session_id.as_str()), Some(CODEX_ID));
+        let rows = vec![
+            row("home-shell", "marian", "/Users/me"),
+            row("scraper-tab", "scraper", "/Users/me"),
+        ];
+        let (assigned, _) = assign_sessions(
+            &rows,
+            std::slice::from_ref(&scraper),
+            snapshots.path(),
+            false,
+        );
+        assert_eq!(
+            assigned.get("scraper-tab").map(|s| s.session_id.as_str()),
+            Some(CODEX_ID)
+        );
         assert!(!assigned.contains_key("home-shell"));
 
-        let fresh_but_misattributed = session(Agent::Codex, "ttys001", "/Users/me/work/fws-cms", "wrong");
+        let fresh_but_misattributed =
+            session(Agent::Codex, "ttys001", "/Users/me/work/fws-cms", "wrong");
         let rows = vec![row("home-shell", "marian", "/Users/me")];
-        let (assigned, _) = assign_sessions(&rows, &[fresh_but_misattributed], snapshots.path(), false);
+        let (assigned, _) =
+            assign_sessions(&rows, &[fresh_but_misattributed], snapshots.path(), false);
         assert!(assigned.is_empty());
     }
 
     #[test]
     fn reads_the_cd_argument() {
-        assert_eq!(codex_cd_argument("codex -C /tmp/x"), Some(PathBuf::from("/tmp/x")));
-        assert_eq!(codex_cd_argument("codex --cd=/y/z resume"), Some(PathBuf::from("/y/z")));
-        assert_eq!(codex_cd_argument(r#"codex --cd "/a b""#), Some(PathBuf::from("/a b")));
+        assert_eq!(
+            codex_cd_argument("codex -C /tmp/x"),
+            Some(PathBuf::from("/tmp/x"))
+        );
+        assert_eq!(
+            codex_cd_argument("codex --cd=/y/z resume"),
+            Some(PathBuf::from("/y/z"))
+        );
+        assert_eq!(
+            codex_cd_argument(r#"codex --cd "/a b""#),
+            Some(PathBuf::from("/a b"))
+        );
         assert_eq!(codex_cd_argument("codex resume"), None);
+    }
+
+    #[test]
+    fn matches_pi_sessions_by_tty_even_with_identical_titles_and_directories() {
+        let temp = TempDir::new().unwrap();
+        let mut first = row("first", "π - project", "/tmp/project");
+        first.tty = "/dev/ttys002".into();
+        let mut second = row("second", "π - project", "/tmp/project");
+        second.tty = "/dev/ttys001".into();
+        let sessions = [
+            session(Agent::Pi, "ttys001", "/tmp/project", "one"),
+            session(Agent::Pi, "ttys002", "/tmp/project", "two"),
+        ];
+        let (assigned, warnings) = assign_sessions(&[first, second], &sessions, temp.path(), true);
+        assert!(warnings.is_empty());
+        assert_eq!(assigned["first"].session_id, "two");
+        assert_eq!(assigned["second"].session_id, "one");
+
+        let rows = [row("unknown-tty", "π - project", "/tmp/project")];
+        let (assigned, warnings) = assign_sessions(&rows, &sessions, temp.path(), true);
+        assert!(assigned.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("TTY"));
+    }
+
+    #[test]
+    fn discovers_interactive_pi_but_not_rpc_or_background_pi() {
+        let ps = "100 1 ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+                  200 100 ttys001 /bin/zsh -l\n\
+                  300 200 ttys001 pi\n\
+                  400 200 ttys002 pi-rpc\n\
+                  500 200 ?? pi\n\
+                  600 1 ttys003 pi";
+        let sessions = discover_sessions(
+            ps,
+            |_| Some("/tmp/project".into()),
+            |_, _, _, _| Some("pi-session".into()),
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 300);
     }
 
     #[test]
@@ -1059,6 +1212,7 @@ mod tests {
                     Agent::Amp => AMP_ID.into(),
                     Agent::Claude => CLAUDE_ID.into(),
                     Agent::Codex => CODEX_ID.into(),
+                    Agent::Pi => "pi-session".into(),
                 })
             },
         );

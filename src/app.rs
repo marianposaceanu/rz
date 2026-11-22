@@ -16,7 +16,7 @@ use crate::{
     cli::{self, Command, RestoreOptions, SaveOptions},
     command, ghostty,
     model::{Agent, SNAPSHOT_VERSION, Scope, Snapshot},
-    ui,
+    pi, ui,
 };
 
 static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -68,6 +68,20 @@ impl App {
             Command::WatchStatus => self.watch_status(),
             Command::WatchStop => self.stop_watch(),
             Command::WatchWorker(options) => self.run_watch_worker(options),
+            Command::InstallPiExtension => {
+                let path = pi::install(&self.home)?;
+                ui::print_box(
+                    "PI SESSION SUPPORT",
+                    &[
+                        ui::labeled("INSTALLED", path.to_string_lossy()),
+                        ui::labeled(
+                            "NEXT",
+                            "Run /reload in existing Pi terminals, or start Pi again.",
+                        ),
+                    ],
+                );
+                Ok(())
+            }
             Command::Help => {
                 println!("{}", cli::USAGE);
                 Ok(())
@@ -137,13 +151,20 @@ impl App {
             }
             bail!("Ghostty has no restorable terminal surfaces");
         }
-        let process_sessions = agents::running_sessions(&self.home)?;
+        let warning_ttys = target_window_id.map(|_| {
+            rows.iter()
+                .map(|row| row.tty.trim_start_matches("/dev/").to_owned())
+                .collect::<HashSet<_>>()
+        });
+        let (process_sessions, discovery_warnings) =
+            agents::running_sessions(&self.home, warning_ttys.as_ref())?;
         let (assignments, mut warnings) = agents::assign_sessions(
             &rows,
             &process_sessions,
             &self.snapshots_dir,
             target_window_id.is_none(),
         );
+        warnings.extend(discovery_warnings);
         let windows_with_geometry = rows.iter().fold(BTreeMap::new(), |mut windows, row| {
             windows
                 .entry(row.window_index)
@@ -161,7 +182,7 @@ impl App {
         for row in &mut rows {
             if let Some(session) = assignments.get(&row.terminal_id) {
                 row.agent_session = Some(session.clone());
-                if row.working_directory.as_os_str().is_empty() {
+                if session.agent == Agent::Pi || row.working_directory.as_os_str().is_empty() {
                     row.working_directory = session.cwd.clone();
                 }
             }
@@ -233,6 +254,10 @@ impl App {
                     .count(),
                 terminals
                     .iter()
+                    .filter(|terminal| terminal.pi_session_id.is_some())
+                    .count(),
+                terminals
+                    .iter()
                     .filter(|terminal| terminal.scrollback_file.is_some())
                     .count(),
                 options.capture_scrollback,
@@ -268,7 +293,8 @@ impl App {
         let running_sessions = if options.close_existing {
             HashSet::new()
         } else {
-            agents::running_sessions(&self.home)?
+            agents::running_sessions(&self.home, None)?
+                .0
                 .into_iter()
                 .map(|session| session.key())
                 .collect()
@@ -547,6 +573,10 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                     .count(),
                 terminals
                     .iter()
+                    .filter(|terminal| terminal.pi_session_id.is_some())
+                    .count(),
+                terminals
+                    .iter()
                     .filter(|terminal| terminal.scrollback_file.is_some())
                     .count(),
                 snapshot.scrollback_captured,
@@ -610,6 +640,9 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                 if let Some(id) = &terminal.claude_session_id {
                     lines.push(ui::labeled("CLAUDE", id));
                 }
+                if let Some(id) = &terminal.pi_session_id {
+                    lines.push(ui::labeled("PI", id));
+                }
             }
         }
     }
@@ -644,6 +677,10 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
     let claude = sessions
         .iter()
         .filter(|session| session.agent == Agent::Claude)
+        .collect::<Vec<_>>();
+    let pi = sessions
+        .iter()
+        .filter(|session| session.agent == Agent::Pi)
         .collect::<Vec<_>>();
     let mut lines = vec![
         ui::labeled("STATUS", "Dry run - Ghostty will not be changed"),
@@ -704,7 +741,25 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
             .iter()
             .map(|session| format!("              {}", session.id)),
     );
+    lines.push(ui::labeled(
+        "PI",
+        if pi.is_empty() {
+            "none".into()
+        } else {
+            format!("{} session(s)", pi.len())
+        },
+    ));
+    lines.extend(
+        pi.iter()
+            .map(|session| format!("              {}", session.id)),
+    );
     lines.push(ui::labeled("LOCATION", directory.to_string_lossy()));
+    lines.extend(
+        snapshot
+            .warnings
+            .iter()
+            .map(|warning| ui::labeled("WARNING", warning)),
+    );
     lines.extend(
         snapshot
             .limitations
@@ -747,6 +802,7 @@ fn content_summary(
     codex: usize,
     amp: usize,
     claude: usize,
+    pi: usize,
     scrollback: usize,
     captured: bool,
 ) -> String {
@@ -756,7 +812,7 @@ fn content_summary(
         "scrollback skipped".into()
     };
     format!(
-        "{codex} Codex session(s)  |  {amp} Amp thread(s)  |  {claude} Claude session(s)  |  {scrollback}"
+        "{codex} Codex session(s)  |  {amp} Amp thread(s)  |  {claude} Claude session(s)  |  {pi} Pi session(s)  |  {scrollback}"
     )
 }
 
@@ -830,6 +886,12 @@ mod tests {
         );
         assert_eq!(snapshot.detected_codex_sessions[0].agent, Agent::Codex);
         assert!(snapshot.detected_claude_sessions.is_empty());
+        assert!(snapshot.detected_pi_sessions.is_empty());
+        assert!(
+            snapshot.windows[0].tabs[0].terminals[0]
+                .pi_session_id
+                .is_none()
+        );
     }
 
     #[test]

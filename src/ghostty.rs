@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-const CAPTURE_HEADER: [&str; 17] = [
+const CAPTURE_HEADER: [&str; 18] = [
     "window_index",
     "window_id",
     "window_name",
@@ -33,6 +33,7 @@ const CAPTURE_HEADER: [&str; 17] = [
     "terminal_focused",
     "working_directory",
     "scrollback_path",
+    "tty",
 ];
 
 pub fn ensure_running() -> Result<()> {
@@ -93,8 +94,8 @@ fn parse_capture(output: &str) -> Result<Vec<CaptureRow>> {
 
 fn parse_capture_row(line: &str) -> Result<CaptureRow> {
     let mut values = line.split('\t').collect::<Vec<_>>();
-    if values.len() == CAPTURE_HEADER.len() - 1 {
-        values.push("");
+    if (CAPTURE_HEADER.len() - 2..CAPTURE_HEADER.len()).contains(&values.len()) {
+        values.resize(CAPTURE_HEADER.len(), "");
     }
     if values.len() != CAPTURE_HEADER.len() {
         bail!("malformed Ghostty capture row");
@@ -113,6 +114,7 @@ fn parse_capture_row(line: &str) -> Result<CaptureRow> {
         tab_selected: values[10].eq_ignore_ascii_case("true"),
         terminal_index: parse_number(values[11], "terminal index")?,
         terminal_id: values[12].to_owned(),
+        tty: values[17].to_owned(),
         terminal_name: values[13].to_owned(),
         terminal_focused: values[14].eq_ignore_ascii_case("true"),
         working_directory: PathBuf::from(values[15]),
@@ -194,6 +196,8 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                                 codex_session_id: None,
                                 amp_thread_id: None,
                                 claude_session_id: None,
+                                pi_session_id: None,
+                                pi_session_file: None,
                             };
                             if let Some(session) = &row.agent_session {
                                 match session.agent {
@@ -206,6 +210,13 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                                     Agent::Claude => {
                                         terminal.claude_session_id =
                                             Some(session.session_id.clone())
+                                    }
+                                    Agent::Pi => {
+                                        terminal.pi_session_id = Some(session.session_id.clone());
+                                        terminal.pi_session_file = session
+                                            .session_file
+                                            .as_ref()
+                                            .map(|path| path.to_string_lossy().into_owned());
                                     }
                                 }
                             }
@@ -256,6 +267,12 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         .filter(|session| session.agent == Agent::Claude)
         .cloned()
         .collect();
+    let detected_pi_sessions = input
+        .process_sessions
+        .iter()
+        .filter(|session| session.agent == Agent::Pi)
+        .cloned()
+        .collect();
     Snapshot {
         version: SNAPSHOT_VERSION,
         name: input.name.to_owned(),
@@ -276,6 +293,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         detected_codex_sessions,
         detected_amp_threads,
         detected_claude_sessions,
+        detected_pi_sessions,
         warnings: input.warnings,
         limitations: vec![
             "Ghostty does not expose split geometry; terminal counts restore as right-hand splits."
@@ -286,7 +304,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
             } else {
                 "Scrollback was intentionally skipped for this fast snapshot.".into()
             },
-            "Only Codex, Amp, and Claude sessions are resumed; arbitrary child processes are not reconstructible."
+            "Only Codex, Amp, Claude, and Pi sessions are resumed; arbitrary child processes are not reconstructible."
                 .into(),
         ],
     }
@@ -479,6 +497,15 @@ fn restore_command(
                 Agent::Amp => format!("exec {binary} threads continue {id}"),
                 Agent::Claude => format!("exec {binary} --resume {id}"),
                 Agent::Codex => format!("exec {binary} resume {id}"),
+                Agent::Pi => match terminal.pi_session_file.as_deref() {
+                    Some(file) => {
+                        let file = shell_quote(file);
+                        format!(
+                            "if [ -f {file} ]; then exec {binary} --session {file}; else /usr/bin/printf '\\n[rz] Pi session file missing: %s\\n' {file}; exec /bin/zsh -l; fi"
+                        )
+                    }
+                    None => format!("exec {binary} --session {id}"),
+                },
             });
         }
         Some(session) => {
@@ -627,13 +654,15 @@ mod tests {
             codex_session_id: None,
             amp_thread_id: Some("T-01a023e2-3f9d-7705-98ed-4ea63108e87e".into()),
             claude_session_id: None,
+            pi_session_id: None,
+            pi_session_file: None,
         }
     }
 
     #[test]
     fn parses_capture_tsv() {
         let output = format!(
-            "{}\n2\twindow-current\tWork\t100\t120\t1200\t800\t1\ttab-1\tProject\ttrue\t1\tterminal-1\tamp\ttrue\t/tmp/project\t\n",
+            "{}\n2\twindow-current\tWork\t100\t120\t1200\t800\t1\ttab-1\tProject\ttrue\t1\tterminal-1\tamp\ttrue\t/tmp/project\t\t/dev/ttys001\n",
             CAPTURE_HEADER.join("\t")
         );
         let rows = parse_capture(&output).unwrap();
@@ -641,6 +670,7 @@ mod tests {
         assert_eq!(rows[0].window_index, 2);
         assert_eq!(rows[0].working_directory, Path::new("/tmp/project"));
         assert_eq!(rows[0].scrollback_path, None);
+        assert_eq!(rows[0].tty, "/dev/ttys001");
     }
 
     #[test]
@@ -669,6 +699,41 @@ mod tests {
         );
         assert!(command.contains("Amp thread already running"));
         assert!(!command.contains("amp threads continue"));
+        assert_eq!(duplicates.len(), 1);
+    }
+
+    #[test]
+    fn restores_pi_by_exact_file_and_avoids_duplicates() {
+        let mut terminal = terminal();
+        terminal.amp_thread_id = None;
+        let mut value = serde_json::to_value(terminal).unwrap();
+        value["pi_session_id"] = "pi-session".into();
+        value["pi_session_file"] = "/tmp/Pi sessions/it's work.jsonl".into();
+        let terminal: Terminal = serde_json::from_value(value).unwrap();
+        let command = restore_command(
+            &terminal,
+            Path::new("/tmp/state"),
+            &HashSet::new(),
+            &mut Vec::new(),
+            Path::new("/Users/me/project"),
+            None,
+        );
+        assert!(command.contains("pi --session"));
+        assert!(command.contains("Pi sessions"));
+        assert!(!command.contains("--continue"));
+
+        let mut duplicates = Vec::new();
+        let running = HashSet::from([terminal.session().unwrap().key()]);
+        let command = restore_command(
+            &terminal,
+            Path::new("/tmp/state"),
+            &running,
+            &mut duplicates,
+            Path::new("/Users/me/project"),
+            None,
+        );
+        assert!(command.contains("Pi session already running"));
+        assert!(!command.contains("pi --session"));
         assert_eq!(duplicates.len(), 1);
     }
 

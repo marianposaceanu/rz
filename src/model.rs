@@ -32,6 +32,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub detected_claude_sessions: Vec<AgentSession>,
     #[serde(default)]
+    pub detected_pi_sessions: Vec<AgentSession>,
+    #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
     pub limitations: Vec<String>,
@@ -106,6 +108,10 @@ pub struct Terminal {
     pub amp_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_session_file: Option<String>,
 }
 
 impl Terminal {
@@ -118,6 +124,11 @@ impl Terminal {
         } else if let Some(id) = self.amp_thread_id.as_deref() {
             Some(SessionRef {
                 agent: Agent::Amp,
+                id,
+            })
+        } else if let Some(id) = self.pi_session_id.as_deref() {
+            Some(SessionRef {
+                agent: Agent::Pi,
                 id,
             })
         } else {
@@ -135,6 +146,7 @@ pub enum Agent {
     Amp,
     Claude,
     Codex,
+    Pi,
 }
 
 impl Agent {
@@ -143,6 +155,7 @@ impl Agent {
             Self::Amp => "Amp",
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Pi => "Pi",
         }
     }
 
@@ -151,6 +164,7 @@ impl Agent {
             Self::Amp => "thread",
             Self::Claude => "session",
             Self::Codex => "session",
+            Self::Pi => "session",
         }
     }
 }
@@ -161,6 +175,7 @@ impl fmt::Display for Agent {
             Self::Amp => "amp",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         })
     }
 }
@@ -175,6 +190,8 @@ pub struct AgentSession {
     pub session_id: String,
     #[serde(default)]
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<PathBuf>,
 }
 
 const fn default_agent() -> Agent {
@@ -226,6 +243,7 @@ pub struct CaptureRow {
     pub tab_selected: bool,
     pub terminal_index: usize,
     pub terminal_id: String,
+    pub tty: String,
     pub terminal_name: String,
     pub terminal_focused: bool,
     pub working_directory: PathBuf,

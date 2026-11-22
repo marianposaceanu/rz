@@ -12,7 +12,7 @@ on run arguments
             set targetWindowId to item (argumentIndex + 1) of arguments as text
         end if
     end repeat
-    set reportText to "window_index" & separator & "window_id" & separator & "window_name" & separator & "window_x" & separator & "window_y" & separator & "window_width" & separator & "window_height" & separator & "tab_index" & separator & "tab_id" & separator & "tab_name" & separator & "tab_selected" & separator & "terminal_index" & separator & "terminal_id" & separator & "terminal_name" & separator & "terminal_focused" & separator & "working_directory" & separator & "scrollback_path" & linefeed
+    set reportText to "window_index" & separator & "window_id" & separator & "window_name" & separator & "window_x" & separator & "window_y" & separator & "window_width" & separator & "window_height" & separator & "tab_index" & separator & "tab_id" & separator & "tab_name" & separator & "tab_selected" & separator & "terminal_index" & separator & "terminal_id" & separator & "terminal_name" & separator & "terminal_focused" & separator & "working_directory" & separator & "scrollback_path" & separator & "tty" & linefeed
     set clipboardWasSaved to false
     set savedClipboard to missing value
 
@@ -56,6 +56,10 @@ on run arguments
                     set terminalId to id of terminalProperties as text
                     set terminalName to name of terminalProperties as text
                     set terminalDirectory to working directory of terminalProperties as text
+                    set terminalTty to ""
+                    try
+                        set terminalTty to tty of currentTerminal as text
+                    end try
                     set terminalFocused to (terminalId is focusedTerminalId) as text
                     set scrollbackPath to ""
 
@@ -84,7 +88,7 @@ on run arguments
                         end try
                     end if
 
-                    set reportText to reportText & windowIndex & separator & my cleanField(windowId) & separator & my cleanField(windowName) & separator & windowX & separator & windowY & separator & windowWidth & separator & windowHeight & separator & tabIndex & separator & my cleanField(tabId) & separator & my cleanField(tabName) & separator & tabSelected & separator & terminalIndex & separator & my cleanField(terminalId) & separator & my cleanField(terminalName) & separator & terminalFocused & separator & my cleanField(terminalDirectory) & separator & my cleanField(scrollbackPath) & linefeed
+                    set reportText to reportText & windowIndex & separator & my cleanField(windowId) & separator & my cleanField(windowName) & separator & windowX & separator & windowY & separator & windowWidth & separator & windowHeight & separator & tabIndex & separator & my cleanField(tabId) & separator & my cleanField(tabName) & separator & tabSelected & separator & terminalIndex & separator & my cleanField(terminalId) & separator & my cleanField(terminalName) & separator & terminalFocused & separator & my cleanField(terminalDirectory) & separator & my cleanField(scrollbackPath) & separator & my cleanField(terminalTty) & linefeed
                 end repeat
             end repeat
             end if

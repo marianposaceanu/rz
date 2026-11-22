@@ -22,13 +22,12 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use crate::{
     App,
     app::{random_hex, validate_name},
-    cli::{WatchOptions, WatchScope, WorkerOptions},
+    cli::{MINIMUM_WATCH_INTERVAL, WatchOptions, WatchScope, WorkerOptions},
     command, ghostty,
     model::WatchState,
-    ui,
+    storage,
+    ui::{self, display_time},
 };
-
-const MINIMUM_WATCH_INTERVAL: u64 = 10;
 
 impl App {
     pub(crate) fn start_watch(&self, options: WatchOptions) -> Result<()> {
@@ -278,7 +277,7 @@ impl App {
             update_watch_state(state_path, &options.token, |state| {
                 if success {
                     state.last_success_at = Some(completed.to_rfc3339());
-                    state.last_snapshot_id = self.newest_snapshot_id(&options.name);
+                    state.last_snapshot_id = self.snapshots.latest_id(&options.name).ok().flatten();
                     state.last_error = None;
                 } else {
                     state.last_error = Some(format!(
@@ -312,19 +311,7 @@ fn read_watch_state(path: &Path) -> Option<WatchState> {
 }
 
 fn write_watch_state(path: &Path, state: &WatchState) -> Result<()> {
-    fs::create_dir_all(path.parent().context("watch state has no parent")?)?;
-    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut json = serde_json::to_string_pretty(state)?;
-        json.push('\n');
-        fs::write(&temporary, json)?;
-        fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    storage::write_json(path, state)
 }
 
 fn update_watch_state(
@@ -395,12 +382,6 @@ fn display_interval(seconds: u64) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-fn display_time(value: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|time| time.format("%Y-%m-%d %H:%M:%S %:z").to_string())
-        .unwrap_or_else(|_| value.to_owned())
 }
 
 #[cfg(test)]

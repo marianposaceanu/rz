@@ -78,8 +78,8 @@ counts per tab. `--list NUMBER` shows the saved pane bounds and creating version
 
 ### Scrollback storage
 
-Scrollback is compressed with fast LZ4 by default, including automatic watcher
-snapshots. Compression and playback are built into `rz`; no external compressor
+Scrollback is compressed with fast LZ4 by default. Watchers skip scrollback for
+fast automatic saves. Compression and playback are built into `rz`; no external compressor
 is required. Files use the standard LZ4 frame format with a content checksum.
 The save summary shows the original and compressed sizes. Snapshot metadata stays
 readable in `state.json` alongside `scrollback/*.txt.lz4` files.

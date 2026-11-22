@@ -7,6 +7,20 @@ use std::{
 
 use anyhow::{Context, Result};
 use lz4_flex::frame::{FrameDecoder, FrameEncoder, FrameInfo};
+use serde::Serialize;
+use tempfile::NamedTempFile;
+
+pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().context("state path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    let mut json = serde_json::to_vec_pretty(value)?;
+    json.push(b'\n');
+    temporary.write_all(&json)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Usage {
@@ -82,11 +96,24 @@ pub fn replay_scrollback(path: &Path, output: &mut impl Write) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
 
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn failed_json_write_preserves_previous_state_and_removes_temporary_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.json");
+        write_json(&path, &vec!["previous"]).unwrap();
+        let previous = fs::read(&path).unwrap();
+        let invalid = BTreeMap::from([(vec![1, 2], "invalid JSON map key")]);
+        assert!(write_json(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn lz4_round_trip_preserves_terminal_bytes_and_plain_snapshots() {

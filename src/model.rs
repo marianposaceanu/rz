@@ -46,6 +46,20 @@ pub struct Snapshot {
     pub limitations: Vec<String>,
 }
 
+impl Snapshot {
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.windows.iter().flat_map(|window| &window.tabs)
+    }
+
+    pub fn terminals(&self) -> impl Iterator<Item = &Terminal> {
+        self.tabs().flat_map(|tab| &tab.terminals)
+    }
+
+    pub fn sessions(&self) -> impl Iterator<Item = SessionRef<'_>> {
+        self.terminals().filter_map(Terminal::session)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Scope {
@@ -127,27 +141,14 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn session(&self) -> Option<SessionRef<'_>> {
-        if let Some(id) = self.codex_session_id.as_deref() {
-            Some(SessionRef {
-                agent: Agent::Codex,
-                id,
-            })
-        } else if let Some(id) = self.amp_thread_id.as_deref() {
-            Some(SessionRef {
-                agent: Agent::Amp,
-                id,
-            })
-        } else if let Some(id) = self.pi_session_id.as_deref() {
-            Some(SessionRef {
-                agent: Agent::Pi,
-                id,
-            })
-        } else {
-            self.claude_session_id.as_deref().map(|id| SessionRef {
-                agent: Agent::Claude,
-                id,
-            })
-        }
+        [
+            (Agent::Codex, &self.codex_session_id),
+            (Agent::Amp, &self.amp_thread_id),
+            (Agent::Pi, &self.pi_session_id),
+            (Agent::Claude, &self.claude_session_id),
+        ]
+        .into_iter()
+        .find_map(|(agent, id)| id.as_deref().map(|id| SessionRef { agent, id }))
     }
 }
 
@@ -161,6 +162,8 @@ pub enum Agent {
 }
 
 impl Agent {
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Amp, Self::Claude, Self::Pi];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Amp => "Amp",

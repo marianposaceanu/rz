@@ -3,8 +3,10 @@ mod app;
 mod cli;
 mod command;
 mod ghostty;
+mod layout;
 mod model;
 mod pi;
+mod storage;
 mod ui;
 mod watch;
 

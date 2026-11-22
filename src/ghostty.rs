@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -9,13 +10,16 @@ use chrono::Local;
 
 use crate::{
     command,
+    layout::{Layout, Rect},
     model::{
         Agent, AgentSession, CaptureRow, Position, SNAPSHOT_VERSION, Scope, SessionKey, Size,
         Snapshot, Tab, Terminal, Window,
     },
 };
 
-const CAPTURE_HEADER: [&str; 18] = [
+const SPLIT_GEOMETRY: &str = include_str!("../libexec/split-geometry.applescript");
+
+const CAPTURE_HEADER: [&str; 22] = [
     "window_index",
     "window_id",
     "window_name",
@@ -34,6 +38,10 @@ const CAPTURE_HEADER: [&str; 18] = [
     "working_directory",
     "scrollback_path",
     "tty",
+    "pane_x",
+    "pane_y",
+    "pane_width",
+    "pane_height",
 ];
 
 pub fn ensure_running() -> Result<()> {
@@ -68,7 +76,12 @@ pub fn capture(
     capture_scrollback: bool,
     window_id: Option<&str>,
 ) -> Result<Vec<CaptureRow>> {
-    let mut args = vec![script_path.as_os_str().to_owned()];
+    let script = format!("{}\n{SPLIT_GEOMETRY}", fs::read_to_string(script_path)?);
+    let mut args = vec![
+        OsString::from("-e"),
+        OsString::from(script),
+        OsString::from("--"),
+    ];
     if !capture_scrollback {
         args.push(OsString::from("--no-scrollback"));
     }
@@ -94,7 +107,7 @@ fn parse_capture(output: &str) -> Result<Vec<CaptureRow>> {
 
 fn parse_capture_row(line: &str) -> Result<CaptureRow> {
     let mut values = line.split('\t').collect::<Vec<_>>();
-    if (CAPTURE_HEADER.len() - 2..CAPTURE_HEADER.len()).contains(&values.len()) {
+    if (15..CAPTURE_HEADER.len()).contains(&values.len()) {
         values.resize(CAPTURE_HEADER.len(), "");
     }
     if values.len() != CAPTURE_HEADER.len() {
@@ -115,6 +128,16 @@ fn parse_capture_row(line: &str) -> Result<CaptureRow> {
         terminal_index: parse_number(values[11], "terminal index")?,
         terminal_id: values[12].to_owned(),
         tty: values[17].to_owned(),
+        frame: if values[18..22].iter().all(|value| !value.is_empty()) {
+            Some(Rect {
+                x: parse_number(values[18], "pane x")?,
+                y: parse_number(values[19], "pane y")?,
+                width: parse_number(values[20], "pane width")?,
+                height: parse_number(values[21], "pane height")?,
+            })
+        } else {
+            None
+        },
         terminal_name: values[13].to_owned(),
         terminal_focused: values[14].eq_ignore_ascii_case("true"),
         working_directory: PathBuf::from(values[15]),
@@ -198,6 +221,7 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                                 claude_session_id: None,
                                 pi_session_id: None,
                                 pi_session_file: None,
+                                frame: row.frame,
                             };
                             if let Some(session) = &row.agent_session {
                                 match session.agent {
@@ -222,13 +246,25 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
                             }
                             terminal
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    let layout = if terminals.len() == 1 {
+                        Some(Layout::Leaf {
+                            terminal: terminals[0].index,
+                        })
+                    } else {
+                        terminals
+                            .iter()
+                            .map(|terminal| terminal.frame.map(|frame| (terminal.index, frame)))
+                            .collect::<Option<Vec<_>>>()
+                            .and_then(|frames| Layout::infer(&frames))
+                    };
                     Tab {
                         index: tab_index,
                         id: Some(first.tab_id.clone()),
                         name: first.tab_name.clone(),
                         selected: first.tab_selected,
                         terminals,
+                        layout,
                     }
                 })
                 .collect();
@@ -273,6 +309,17 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         .filter(|session| session.agent == Agent::Pi)
         .cloned()
         .collect();
+    let mut warnings = input.warnings;
+    for window in &windows {
+        for tab in &window.tabs {
+            if tab.terminals.len() > 1 && tab.layout.is_none() {
+                warnings.push(format!(
+                    "Split layout for tab {}.{} was unavailable; unzoom panes and grant Accessibility permission before saving. It will restore as right-hand splits.",
+                    window.index, tab.index
+                ));
+            }
+        }
+    }
     Snapshot {
         version: SNAPSHOT_VERSION,
         name: input.name.to_owned(),
@@ -280,6 +327,9 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         saved_at: Local::now().to_rfc3339(),
         timestamp: input.timestamp.to_owned(),
         ghostty_version: input.ghostty_version,
+        rz_version: env!("CARGO_PKG_VERSION").into(),
+        scrollback_bytes: None,
+        scrollback_stored_bytes: None,
         tabs_count,
         terminals_count: input.rows.len(),
         scrollback_captured: input.capture_scrollback,
@@ -294,9 +344,9 @@ pub fn build_snapshot(input: SnapshotInput<'_>) -> Snapshot {
         detected_amp_threads,
         detected_claude_sessions,
         detected_pi_sessions,
-        warnings: input.warnings,
+        warnings,
         limitations: vec![
-            "Ghostty does not expose split geometry; terminal counts restore as right-hand splits."
+            "Pane bounds are restored for the saved window size; macOS window constraints can limit an exact match."
                 .into(),
             if input.capture_scrollback {
                 "Scrollback restores as plain text output, without original styling or interactive state."
@@ -325,6 +375,8 @@ pub fn restore_script(
     ready_file: Option<&Path>,
 ) -> Result<RestorePlan> {
     let mut lines = vec![
+        SPLIT_GEOMETRY.to_owned(),
+        "set rzGeometryFailures to 0".into(),
         "tell application \"Ghostty\"".to_owned(),
         "activate".to_owned(),
     ];
@@ -338,22 +390,36 @@ pub fn restore_script(
         let window_number = window_offset + 1;
         let window_variable = format!("rzWindow{window_number}");
         let mut selected_tab = None;
+        let mut split_lines = Vec::new();
         for (tab_offset, tab) in window.tabs.iter().enumerate() {
             if tab.terminals.is_empty() {
                 continue;
             }
             let tab_number = tab_offset + 1;
-            let first_configuration = format!("rzConfig{window_number}_{tab_number}_1");
-            append_configuration(
-                &mut lines,
-                &first_configuration,
-                &tab.terminals[0],
-                snapshot_dir,
-                running_sessions,
-                &mut duplicates,
-                home,
-                ready_file,
-            );
+            if tab
+                .layout
+                .as_ref()
+                .is_some_and(|layout| !layout.valid_for(tab.terminals.len()))
+            {
+                bail!("invalid split layout in tab {}.{}", window.index, tab.index);
+            }
+            let first_index = tab.layout.as_ref().map_or(1, Layout::first_terminal);
+            let first_configuration = format!("rzConfig{window_number}_{tab_number}_{first_index}");
+            for (terminal_offset, terminal) in tab.terminals.iter().enumerate() {
+                append_configuration(
+                    &mut lines,
+                    &format!(
+                        "rzConfig{window_number}_{tab_number}_{}",
+                        terminal_offset + 1
+                    ),
+                    terminal,
+                    snapshot_dir,
+                    running_sessions,
+                    &mut duplicates,
+                    home,
+                    ready_file,
+                );
+            }
             let tab_variable = format!("rzTab{window_number}_{tab_number}");
             if tab_offset == 0 {
                 lines.push(format!(
@@ -367,32 +433,35 @@ pub fn restore_script(
                     "set {tab_variable} to new tab in {window_variable} with configuration {first_configuration}"
                 ));
             }
-            let first_terminal = format!("rzTerminal{window_number}_{tab_number}_1");
-            let mut terminal_variables = vec![first_terminal.clone()];
+            let terminal_variables = (1..=tab.terminals.len())
+                .map(|index| format!("rzTerminal{window_number}_{tab_number}_{index}"))
+                .collect::<Vec<_>>();
+            let first_terminal = &terminal_variables[first_index - 1];
             lines.push(format!(
                 "set {first_terminal} to focused terminal of {tab_variable}"
             ));
 
-            for (terminal_offset, terminal) in tab.terminals.iter().skip(1).enumerate() {
-                let terminal_number = terminal_offset + 2;
-                let configuration =
-                    format!("rzConfig{window_number}_{tab_number}_{terminal_number}");
-                let terminal_variable =
-                    format!("rzTerminal{window_number}_{tab_number}_{terminal_number}");
-                append_configuration(
-                    &mut lines,
-                    &configuration,
-                    terminal,
-                    snapshot_dir,
-                    running_sessions,
-                    &mut duplicates,
-                    home,
-                    ready_file,
+            if let Some(layout) = &tab.layout {
+                split_lines.push(format!("select tab {tab_variable}"));
+                append_split_layout(
+                    &mut split_lines,
+                    layout,
+                    window_number,
+                    tab_number,
+                    &tab_variable,
                 );
-                lines.push(format!(
+            } else {
+                split_lines.push(format!("select tab {tab_variable}"));
+                for (terminal_offset, _terminal) in tab.terminals.iter().skip(1).enumerate() {
+                    let terminal_number = terminal_offset + 2;
+                    let configuration =
+                        format!("rzConfig{window_number}_{tab_number}_{terminal_number}");
+                    let terminal_variable =
+                        format!("rzTerminal{window_number}_{tab_number}_{terminal_number}");
+                    split_lines.push(format!(
                     "set {terminal_variable} to split {first_terminal} direction right with configuration {configuration}"
                 ));
-                terminal_variables.push(terminal_variable);
+                }
             }
             if !tab.name.is_empty() {
                 lines.push(format!(
@@ -405,15 +474,19 @@ pub fn restore_script(
                 .iter()
                 .position(|terminal| terminal.focused)
                 .unwrap_or(0);
+            if let Some(terminal) = terminal_variables.get(focused) {
+                split_lines.push(format!("focus {terminal}"));
+            }
             if tab.selected {
                 final_focus = terminal_variables.get(focused).cloned();
                 selected_tab = Some(tab_variable);
             }
         }
+        append_window_geometry(&mut lines, window);
+        lines.extend(split_lines);
         if let Some(tab) = selected_tab {
             lines.push(format!("select tab {tab}"));
         }
-        append_window_geometry(&mut lines, window);
     }
     if let Some(terminal) = final_focus {
         lines.push(format!("focus {terminal}"));
@@ -422,12 +495,41 @@ pub fn restore_script(
         append_close_existing(&mut lines, ready_file)?;
     }
     lines.push("end tell".into());
+    lines.push("if rzGeometryFailures > 0 then return \"Window or pane bounds could not be matched for \" & rzGeometryFailures & \" adjustment(s); display or size limits may apply.\"".into());
+    lines.push("return \"\"".into());
     let mut seen = HashSet::new();
     duplicates.retain(|session| seen.insert(session.clone()));
     Ok(RestorePlan {
         script: lines.join("\n"),
         duplicates,
     })
+}
+
+fn append_split_layout(
+    lines: &mut Vec<String>,
+    layout: &Layout,
+    window: usize,
+    tab: usize,
+    tab_variable: &str,
+) {
+    let Layout::Split {
+        direction,
+        first_size,
+        total_size,
+        first,
+        second,
+    } = layout
+    else {
+        return;
+    };
+    let first_terminal = format!("rzTerminal{window}_{tab}_{}", first.first_terminal());
+    let second_index = second.first_terminal();
+    let second_terminal = format!("rzTerminal{window}_{tab}_{second_index}");
+    let configuration = format!("rzConfig{window}_{tab}_{second_index}");
+    lines.push(format!("set {second_terminal} to split {first_terminal} direction {} with configuration {configuration}", direction.action()));
+    lines.push(format!("if not my rzResizeSplit({first_terminal}, {second_terminal}, {tab_variable}, {first_size}, {total_size}, {}) then set rzGeometryFailures to rzGeometryFailures + 1", applescript_string(direction.action())));
+    append_split_layout(lines, first, window, tab, tab_variable);
+    append_split_layout(lines, second, window, tab, tab_variable);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -483,10 +585,20 @@ fn restore_command(
     if let Some(relative) = terminal.scrollback_file.as_deref() {
         let scrollback = snapshot_dir.join(relative);
         if scrollback.is_file() {
-            commands.push(format!(
-                "/bin/cat -- {}",
-                shell_quote(&scrollback.to_string_lossy())
-            ));
+            let file = shell_quote(&scrollback.to_string_lossy());
+            if scrollback
+                .extension()
+                .is_some_and(|extension| extension == "lz4")
+            {
+                let binary = std::env::current_exe()
+                    .map_or_else(|_| "rz".into(), |path| path.to_string_lossy().into_owned());
+                commands.push(format!(
+                    "{} --replay-scrollback {file}",
+                    shell_word(&binary)
+                ));
+            } else {
+                commands.push(format!("/bin/cat -- {file}"));
+            }
         }
     }
     match terminal.session() {
@@ -603,6 +715,8 @@ fn append_window_geometry(lines: &mut Vec<String>, window: &Window) {
             "set position of front window to {{{}, {}}}",
             position.x, position.y
         ),
+        format!("if (size of front window) is not {{{}, {}}} then set rzGeometryFailures to rzGeometryFailures + 1", size.width, size.height),
+        format!("if (position of front window) is not {{{}, {}}} then set rzGeometryFailures to rzGeometryFailures + 1", position.x, position.y),
         "end tell".into(),
         "end tell".into(),
     ]);
@@ -656,6 +770,7 @@ mod tests {
             claude_session_id: None,
             pi_session_id: None,
             pi_session_file: None,
+            frame: None,
         }
     }
 
@@ -700,6 +815,112 @@ mod tests {
         assert!(command.contains("Amp thread already running"));
         assert!(!command.contains("amp threads continue"));
         assert_eq!(duplicates.len(), 1);
+    }
+
+    #[test]
+    fn creates_and_resizes_parent_splits_before_their_children() {
+        let mut pane = terminal();
+        pane.amp_thread_id = None;
+        let terminals = (1..=4)
+            .map(|index| {
+                let mut pane = pane.clone();
+                pane.index = index;
+                pane
+            })
+            .collect::<Vec<_>>();
+        let frames = [
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 696,
+                    height: 452,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 452,
+                    width: 696,
+                    height: 287,
+                },
+            ),
+            (
+                3,
+                Rect {
+                    x: 696,
+                    y: 0,
+                    width: 403,
+                    height: 308,
+                },
+            ),
+            (
+                4,
+                Rect {
+                    x: 696,
+                    y: 308,
+                    width: 403,
+                    height: 431,
+                },
+            ),
+        ];
+        let layout = Layout::infer(&frames).unwrap();
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "version": 1, "id": "test", "saved_at": "2026-11-22T13:00:00Z",
+            "windows": [{"index": 1, "tabs": [{"index": 1, "terminals": terminals, "layout": layout}]}],
+        })).unwrap();
+        let script = restore_script(
+            &snapshot,
+            Path::new("/tmp/state"),
+            &HashSet::new(),
+            Path::new("/tmp"),
+            false,
+            None,
+        )
+        .unwrap()
+        .script;
+        let root_resize = script
+            .find("my rzResizeSplit(rzTerminal1_1_1, rzTerminal1_1_3")
+            .unwrap();
+        let child_split = script
+            .find("set rzTerminal1_1_2 to split rzTerminal1_1_1 direction down")
+            .unwrap();
+        assert!(root_resize < child_split);
+        assert!(script.contains("set rzTerminal1_1_4 to split rzTerminal1_1_3 direction down"));
+        let mut invalid = snapshot;
+        invalid.windows[0].tabs[0].layout = Some(Layout::Leaf { terminal: 1 });
+        assert!(
+            restore_script(
+                &invalid,
+                Path::new("/tmp/state"),
+                &HashSet::new(),
+                Path::new("/tmp"),
+                false,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn restores_compressed_scrollback_without_printing_lz4_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("history.txt.lz4"), b"compressed").unwrap();
+        let mut terminal = terminal();
+        terminal.amp_thread_id = None;
+        terminal.scrollback_file = Some("history.txt.lz4".into());
+        let command = restore_command(
+            &terminal,
+            temp.path(),
+            &HashSet::new(),
+            &mut Vec::new(),
+            Path::new("/tmp/project"),
+            None,
+        );
+        assert!(command.contains("--replay-scrollback"));
+        assert!(!command.contains("/bin/cat --"));
     }
 
     #[test]

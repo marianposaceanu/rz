@@ -30,6 +30,7 @@ pub enum Command {
     WatchStop,
     WatchWorker(WorkerOptions),
     InstallPiExtension,
+    ReplayScrollback(std::path::PathBuf),
     Help,
     Version,
 }
@@ -92,6 +93,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         Some("--clean") => parse_clean(&args[1..]),
         Some("--list") => parse_list(&args[1..]).map(Command::List),
         Some("--install-pi-extension") if args.len() == 1 => Ok(Command::InstallPiExtension),
+        Some("--replay-scrollback") if args.len() == 2 => {
+            Ok(Command::ReplayScrollback(args[1].clone().into()))
+        }
         Some("--help") if args.len() == 1 => Ok(Command::Help),
         Some("--version" | "-V") if args.len() == 1 => Ok(Command::Version),
         _ => parse_restore(&args).map(Command::Restore),

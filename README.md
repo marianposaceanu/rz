@@ -1,8 +1,9 @@
 # rz
 
 `rz` saves and restores native [Ghostty](https://ghostty.org/) workspaces on
-macOS. A snapshot records windows, tabs, terminal surfaces, working directories,
-focus, window geometry, non-empty scrollback, Codex conversation IDs, Amp thread
+macOS. A snapshot records windows, tabs, terminal surfaces, split directions and
+pane bounds, working directories, focus, window geometry, non-empty scrollback,
+Codex conversation IDs, Amp thread
 IDs, Claude Code session IDs, and Pi sessions.
 
 `rz` is a small native executable written in Rust. Snapshots created by the
@@ -71,6 +72,36 @@ window by default; pass `--all-windows` to save the complete app.
 Snapshots and watcher state live under
 `~/.local/state/ghostty-rz`. Override that location with `RZ_STATE_DIR`.
 
+Every output header shows the running `rz` version. Save output and `--list`
+include snapshot sizes and total storage on disk, compact agent counts, and pane
+counts per tab. `--list NUMBER` shows the saved pane bounds and creating version.
+
+### Scrollback storage
+
+Scrollback is compressed with fast LZ4 by default, including automatic watcher
+snapshots. Compression and playback are built into `rz`; no external compressor
+is required. Files use the standard LZ4 frame format with a content checksum.
+The save summary shows the original and compressed sizes. Snapshot metadata stays
+readable in `state.json` alongside `scrollback/*.txt.lz4` files.
+
+Older snapshots with plain-text scrollback remain restorable. `--no-scrollback`
+continues to skip terminal history entirely. Pi, Codex, Amp, and Claude conversation
+files remain in their own storage locations; snapshot sizes do not include them.
+
+### Split layouts
+
+For tabs with multiple panes, `rz` reads pane bounds through macOS Accessibility,
+reconstructs left/right and top/bottom splits, and adjusts each divider while
+restoring. Nested and mixed layouts are supported. Capture temporarily selects
+tabs to measure their panes, then restores the original selection.
+
+Grant Accessibility permission to the terminal running `rz`. Unzoom panes before
+saving so every pane can be measured. Exact pane bounds can be reproduced at the
+saved window size; changed displays, window constraints, and Ghostty's minimum
+pane sizes can prevent a match. `rz` reports unavailable layouts and failed divider
+adjustments. Snapshots created before this support lack split geometry; save a
+fresh snapshot to preserve the layout.
+
 When a terminal is running Codex, [Amp](https://ampcode.com/), Claude Code, or [Pi](https://pi.dev/),
 `rz` associates the process with that exact Ghostty terminal. Restore uses
 `codex resume` for a Codex conversation, `amp threads continue` for an Amp
@@ -120,8 +151,8 @@ guessing a conversation.
 
 ## Limits
 
-Ghostty exposes terminal surfaces but not its split tree or pane proportions, so
-additional surfaces restore as right-hand splits. Scrollback is replayed as text,
+When split geometry is unavailable, additional surfaces restore as right-hand
+splits. Scrollback is replayed as text,
 not as a running process. `rz` can resume detected Codex conversations, Amp
 threads, Claude Code sessions, and tracked Pi sessions, but it cannot reconstruct
 arbitrary programs. A Codex conversation resumed through the picker is only

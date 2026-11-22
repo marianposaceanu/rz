@@ -74,10 +74,14 @@ pub fn running_sessions(
             Some(session) => {
                 pi_sessions.insert(process.pid, session);
             }
-            None if warning_ttys.is_none_or(|ttys| ttys.contains(&process.tty)) => warnings.push(format!(
-                "Pi on {} has no saved session mapping; run rz --install-pi-extension and /reload in Pi. Only persisted sessions can resume.",
-                process.tty
-            )),
+            None if warning_ttys.is_none_or(|ttys| ttys.contains(&process.tty)) => {
+                let action = if agent_dir.join("extensions/rz-session-tracker.ts").is_file() {
+                    "Run /reload in Pi, then save again. Ephemeral sessions cannot resume."
+                } else {
+                    "Run rz --install-pi-extension, then /reload in Pi and save again."
+                };
+                warnings.push(format!("Pi on {} was not saved. {action}", process.tty));
+            }
             None => {}
         }
     }
@@ -952,6 +956,7 @@ mod tests {
             terminal_index: 1,
             terminal_id: id.into(),
             tty: String::new(),
+            frame: None,
             terminal_name: title.into(),
             terminal_focused: true,
             working_directory: cwd.into(),

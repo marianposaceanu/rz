@@ -16,7 +16,7 @@ use crate::{
     cli::{self, Command, RestoreOptions, SaveOptions},
     command, ghostty,
     model::{Agent, SNAPSHOT_VERSION, Scope, Snapshot},
-    pi, ui,
+    pi, storage, ui,
 };
 
 static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -68,6 +68,10 @@ impl App {
             Command::WatchStatus => self.watch_status(),
             Command::WatchStop => self.stop_watch(),
             Command::WatchWorker(options) => self.run_watch_worker(options),
+            Command::ReplayScrollback(path) => {
+                storage::replay_scrollback(&path, &mut std::io::stdout().lock())?;
+                Ok(())
+            }
             Command::InstallPiExtension => {
                 let path = pi::install(&self.home)?;
                 ui::print_box(
@@ -179,6 +183,8 @@ impl App {
                 "window geometry unavailable; grant your shell Accessibility permission".into(),
             );
         }
+        let mut scrollback_bytes = 0;
+        let mut scrollback_stored_bytes = 0;
         for row in &mut rows {
             if let Some(session) = assignments.get(&row.terminal_id) {
                 row.agent_session = Some(session.clone());
@@ -189,11 +195,16 @@ impl App {
             let Some(source) = row.scrollback_path.as_deref().filter(|path| path.is_file()) else {
                 continue;
             };
+            if source.metadata()?.len() == 0 {
+                continue;
+            }
             let relative = format!(
-                "scrollback/window-{:02}-tab-{:02}-terminal-{:02}.txt",
+                "scrollback/window-{:02}-tab-{:02}-terminal-{:02}.txt.lz4",
                 row.window_index, row.tab_index, row.terminal_index
             );
-            fs::copy(source, staging_dir.join(&relative))?;
+            let destination = staging_dir.join(&relative);
+            scrollback_bytes += storage::compress_scrollback(source, &destination)?;
+            scrollback_stored_bytes += destination.metadata()?.len();
             row.scrollback_file = Some(relative);
         }
         let mut detected_sessions = if target_window_id.is_some() {
@@ -203,7 +214,7 @@ impl App {
         };
         detected_sessions.sort_by_key(|session| (session.agent, session.tty.clone()));
         detected_sessions.dedup_by_key(|session| session.key());
-        let snapshot = ghostty::build_snapshot(ghostty::SnapshotInput {
+        let mut snapshot = ghostty::build_snapshot(ghostty::SnapshotInput {
             name: &options.name,
             id: snapshot_id,
             timestamp,
@@ -214,6 +225,10 @@ impl App {
             target_window_id,
             ghostty_version: ghostty::version()?,
         });
+        if options.capture_scrollback {
+            snapshot.scrollback_bytes = Some(scrollback_bytes);
+            snapshot.scrollback_stored_bytes = Some(scrollback_stored_bytes);
+        }
         let mut json = serde_json::to_string_pretty(&snapshot)?;
         json.push('\n');
         fs::write(staging_dir.join("state.json"), json)?;
@@ -230,42 +245,22 @@ impl App {
             ),
             ui::labeled("LAYOUT", layout_summary(&snapshot)),
         ];
-        lines.extend(saved_tab_lines(&snapshot));
-        let terminals = snapshot
-            .windows
-            .iter()
-            .flat_map(|window| &window.tabs)
-            .flat_map(|tab| &tab.terminals)
-            .collect::<Vec<_>>();
+        lines.extend(content_lines(&snapshot));
         lines.push(ui::labeled(
-            "CONTENT",
-            content_summary(
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.codex_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.amp_thread_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.claude_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.pi_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.scrollback_file.is_some())
-                    .count(),
-                options.capture_scrollback,
+            "SIZE",
+            format!(
+                "{} on disk",
+                storage::format_bytes(storage::usage(final_dir)?.allocated)
             ),
         ));
+        lines.push(ui::labeled("STORAGE", self.storage_summary()?));
+        lines.push(String::new());
+        lines.extend(saved_tab_lines(&snapshot));
+        lines.push(String::new());
         lines.push(ui::labeled("LOCATION", final_dir.to_string_lossy()));
         lines.extend(
-            warnings
+            snapshot
+                .warnings
                 .iter()
                 .map(|warning| ui::labeled("WARNING", warning)),
         );
@@ -336,7 +331,7 @@ impl App {
             ));
         }
         if !output.is_empty() {
-            lines.push(ui::labeled("GHOSTTY", output));
+            lines.push(ui::labeled("WARNING", output));
         }
         ui::print_box("WORKSPACE RESTORED", &lines);
         Ok(())
@@ -363,15 +358,28 @@ impl App {
             };
             return print_snapshot_details(number, directory);
         }
-        let mut lines = Vec::new();
+        let mut lines = vec![
+            ui::labeled("STORAGE", self.storage_summary()?),
+            String::new(),
+        ];
         for (index, directory) in snapshots.iter().rev().enumerate() {
             let snapshot = read_snapshot(directory)?;
             lines.push(format!("{:02}  {}", index + 1, snapshot.id));
             lines.push(format!(
-                "    {}  |  {}",
+                "    {}  |  {}  |  {}",
                 display_time(&snapshot.saved_at),
-                layout_summary(&snapshot)
+                layout_summary(&snapshot),
+                storage::format_bytes(storage::usage(directory)?.allocated),
             ));
+            lines.push(format!("    {}", session_summary(&snapshot)));
+            if !snapshot.warnings.is_empty() {
+                lines.push(format!(
+                    "    {} warning(s); inspect with rz --list {}",
+                    snapshot.warnings.len(),
+                    index + 1
+                ));
+            }
+            lines.push(String::new());
         }
         lines.push(String::new());
         lines.push(ui::labeled(
@@ -380,6 +388,19 @@ impl App {
         ));
         ui::print_box("SAVED WORKSPACES", &lines);
         Ok(())
+    }
+
+    fn storage_summary(&self) -> Result<String> {
+        let size = if self.snapshots_dir.exists() {
+            storage::usage(&self.snapshots_dir)?.allocated
+        } else {
+            0
+        };
+        Ok(format!(
+            "{} | {} on disk",
+            counted(self.snapshot_directories().len(), "snapshot"),
+            storage::format_bytes(size)
+        ))
     }
 
     fn clean(&self, age_seconds: u64) -> Result<()> {
@@ -533,12 +554,6 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
 fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
     let snapshot = read_snapshot(directory)?;
     validate_snapshot(&snapshot)?;
-    let terminals = snapshot
-        .windows
-        .iter()
-        .flat_map(|window| &window.tabs)
-        .flat_map(|tab| &tab.terminals)
-        .collect::<Vec<_>>();
     let scope = match &snapshot.scope {
         Scope::Window { window_id } => format!("Ghostty window {window_id}"),
         Scope::AllWindows => "all Ghostty windows".into(),
@@ -556,34 +571,22 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
         ),
         ui::labeled("SCOPE", scope),
         ui::labeled("LAYOUT", layout_summary(&snapshot)),
-        ui::labeled(
-            "CONTENT",
-            content_summary(
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.codex_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.amp_thread_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.claude_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.pi_session_id.is_some())
-                    .count(),
-                terminals
-                    .iter()
-                    .filter(|terminal| terminal.scrollback_file.is_some())
-                    .count(),
-                snapshot.scrollback_captured,
-            ),
-        ),
-        String::new(),
     ];
+    lines.extend(content_lines(&snapshot));
+    lines.push(ui::labeled(
+        "SIZE",
+        format!(
+            "{} on disk",
+            storage::format_bytes(storage::usage(directory)?.allocated)
+        ),
+    ));
+    if !snapshot.rz_version.is_empty() {
+        lines.push(ui::labeled(
+            "SAVED BY",
+            format!("rz {}", snapshot.rz_version),
+        ));
+    }
+    lines.push(String::new());
     for (window_offset, window) in snapshot.windows.iter().enumerate() {
         if window_offset > 0 {
             lines.push(String::new());
@@ -599,12 +602,15 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
         lines.push(ui::labeled("WINDOW", summary));
         for tab in &window.tabs {
             let mut summary = format!(
-                "{}.{}  {}  |  {} terminal(s)",
+                "{}.{}  {}  |  {}",
                 window.index,
                 tab.index,
                 untitled(&tab.name),
-                tab.terminals.len()
+                counted(tab.terminals.len(), "pane")
             );
+            if let Some(layout) = &tab.layout {
+                summary.push_str(&format!(" | {}", layout.description()));
+            }
             if tab.selected {
                 summary.push_str("  |  selected");
             }
@@ -630,6 +636,15 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                 lines.push(ui::labeled("TERM", summary));
                 if !terminal.working_directory.is_empty() {
                     lines.push(ui::labeled("CWD", &terminal.working_directory));
+                }
+                if let Some(frame) = terminal.frame {
+                    lines.push(ui::labeled(
+                        "BOUNDS",
+                        format!(
+                            "{}x{} at {},{}",
+                            frame.width, frame.height, frame.x, frame.y
+                        ),
+                    ));
                 }
                 if let Some(id) = &terminal.codex_session_id {
                     lines.push(ui::labeled("CODEX", id));
@@ -771,49 +786,129 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
 
 fn layout_summary(snapshot: &Snapshot) -> String {
     format!(
-        "{} window(s)  |  {} tab(s)  |  {} terminal(s)",
-        snapshot.windows.len(),
-        snapshot.tabs_count,
-        snapshot
-            .windows
-            .iter()
-            .flat_map(|window| &window.tabs)
-            .map(|tab| tab.terminals.len())
-            .sum::<usize>()
+        "{} | {} | {}",
+        counted(snapshot.windows.len(), "window"),
+        counted(snapshot.tabs_count, "tab"),
+        counted(
+            snapshot
+                .windows
+                .iter()
+                .flat_map(|window| &window.tabs)
+                .map(|tab| tab.terminals.len())
+                .sum::<usize>(),
+            "pane"
+        )
     )
 }
 
 fn saved_tab_lines(snapshot: &Snapshot) -> Vec<String> {
-    snapshot
-        .windows
-        .iter()
-        .flat_map(|window| {
-            window.tabs.iter().map(|tab| {
-                ui::labeled(
-                    &format!("TAB {}.{}", window.index, tab.index),
-                    untitled(&tab.name),
-                )
-            })
-        })
-        .collect()
+    let mut lines = Vec::new();
+    for window in &snapshot.windows {
+        for tab in &window.tabs {
+            lines.push(ui::labeled(
+                &format!("TAB {}.{}", window.index, tab.index),
+                untitled(&tab.name),
+            ));
+            let agents = [Agent::Codex, Agent::Amp, Agent::Claude, Agent::Pi]
+                .into_iter()
+                .filter_map(|agent| {
+                    let count = tab
+                        .terminals
+                        .iter()
+                        .filter(|terminal| {
+                            terminal
+                                .session()
+                                .is_some_and(|session| session.agent == agent)
+                        })
+                        .count();
+                    (count > 0).then(|| format!("{} {count}", agent.label()))
+                })
+                .collect::<Vec<_>>();
+            let sessions = if agents.is_empty() {
+                "no saved agent sessions".into()
+            } else {
+                agents.join(", ")
+            };
+            let layout = tab
+                .layout
+                .as_ref()
+                .map(|layout| format!(" | {}", layout.description()))
+                .unwrap_or_default();
+            lines.push(ui::labeled(
+                "",
+                format!(
+                    "{}{layout} | {sessions}",
+                    counted(tab.terminals.len(), "pane")
+                ),
+            ));
+        }
+    }
+    lines
 }
 
-fn content_summary(
-    codex: usize,
-    amp: usize,
-    claude: usize,
-    pi: usize,
-    scrollback: usize,
-    captured: bool,
-) -> String {
-    let scrollback = if captured {
-        format!("{scrollback} scrollback file(s)")
+fn counted(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+fn session_summary(snapshot: &Snapshot) -> String {
+    [Agent::Codex, Agent::Amp, Agent::Claude, Agent::Pi]
+        .into_iter()
+        .map(|agent| {
+            let count = snapshot
+                .windows
+                .iter()
+                .flat_map(|window| &window.tabs)
+                .flat_map(|tab| &tab.terminals)
+                .filter(|terminal| {
+                    terminal
+                        .session()
+                        .is_some_and(|session| session.agent == agent)
+                })
+                .count();
+            format!("{} {count}", agent.label())
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn content_lines(snapshot: &Snapshot) -> Vec<String> {
+    let files = snapshot
+        .windows
+        .iter()
+        .flat_map(|window| &window.tabs)
+        .flat_map(|tab| &tab.terminals)
+        .filter(|terminal| terminal.scrollback_file.is_some())
+        .count();
+    let scrollback = if !snapshot.scrollback_captured {
+        "skipped".into()
+    } else if files == 0 {
+        "none".into()
+    } else if let (Some(original), Some(stored)) =
+        (snapshot.scrollback_bytes, snapshot.scrollback_stored_bytes)
+    {
+        let saving = if original == 0 {
+            0.0
+        } else {
+            100.0 * (1.0 - stored as f64 / original as f64)
+        };
+        let change = if saving >= 0.0 {
+            format!("{saving:.1}% smaller")
+        } else {
+            format!("{:.1}% larger", -saving)
+        };
+        format!(
+            "{} | LZ4 | {} -> {} ({change})",
+            counted(files, "file"),
+            storage::format_bytes(original),
+            storage::format_bytes(stored)
+        )
     } else {
-        "scrollback skipped".into()
+        format!("{} | plain text", counted(files, "file"))
     };
-    format!(
-        "{codex} Codex session(s)  |  {amp} Amp thread(s)  |  {claude} Claude session(s)  |  {pi} Pi session(s)  |  {scrollback}"
-    )
+    vec![
+        ui::labeled("SESSIONS", session_summary(snapshot)),
+        ui::labeled("SCROLLBACK", scrollback),
+    ]
 }
 
 fn display_time(value: &str) -> String {
@@ -871,6 +966,21 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn compact_summary_shows_all_agents_and_precise_compression_savings() {
+        let temp = TempDir::new().unwrap();
+        write_snapshot(temp.path(), "work_1", "2026-11-22T13:00:00Z");
+        let mut snapshot = read_snapshot(temp.path()).unwrap();
+        snapshot.scrollback_captured = true;
+        snapshot.scrollback_bytes = Some(1_000_000);
+        snapshot.scrollback_stored_bytes = Some(1_000);
+        snapshot.windows[0].tabs[0].terminals[0].scrollback_file = Some("history.txt.lz4".into());
+        let lines = content_lines(&snapshot);
+        assert!(lines[0].contains("Codex 0 | Amp 0 | Claude 0 | Pi 0"));
+        assert!(lines[1].contains("99.9% smaller"));
+        assert!(lines.iter().all(|line| line.chars().count() <= 88));
     }
 
     #[test]

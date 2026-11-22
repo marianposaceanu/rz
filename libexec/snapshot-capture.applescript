@@ -12,7 +12,7 @@ on run arguments
             set targetWindowId to item (argumentIndex + 1) of arguments as text
         end if
     end repeat
-    set reportText to "window_index" & separator & "window_id" & separator & "window_name" & separator & "window_x" & separator & "window_y" & separator & "window_width" & separator & "window_height" & separator & "tab_index" & separator & "tab_id" & separator & "tab_name" & separator & "tab_selected" & separator & "terminal_index" & separator & "terminal_id" & separator & "terminal_name" & separator & "terminal_focused" & separator & "working_directory" & separator & "scrollback_path" & separator & "tty" & linefeed
+    set reportText to "window_index" & separator & "window_id" & separator & "window_name" & separator & "window_x" & separator & "window_y" & separator & "window_width" & separator & "window_height" & separator & "tab_index" & separator & "tab_id" & separator & "tab_name" & separator & "tab_selected" & separator & "terminal_index" & separator & "terminal_id" & separator & "terminal_name" & separator & "terminal_focused" & separator & "working_directory" & separator & "scrollback_path" & separator & "tty" & separator & "pane_x" & separator & "pane_y" & separator & "pane_width" & separator & "pane_height" & linefeed
     set clipboardWasSaved to false
     set savedClipboard to missing value
 
@@ -22,16 +22,21 @@ on run arguments
     end try
 
     tell application "Ghostty"
+        set initialWindow to front window
+        set capturedWindows to windows
         set windowIndex to 0
-        repeat with currentWindow in windows
+        repeat with currentWindow in capturedWindows
             set windowIndex to windowIndex + 1
             set windowProperties to properties of currentWindow
             set windowId to id of windowProperties as text
             -- Keep the original window index so System Events geometry still
             -- lines up with Ghostty's front-to-back window collection.
             if targetWindowId is "" or windowId is targetWindowId then
+            activate window currentWindow
             set windowName to name of windowProperties as text
-            set windowGeometry to my geometryForWindow(windowIndex)
+            set windowGeometry to my geometryForWindow(1)
+            set originalTab to selected tab of currentWindow
+            set originalTabId to id of originalTab
             set windowX to item 1 of windowGeometry
             set windowY to item 2 of windowGeometry
             set windowWidth to item 3 of windowGeometry
@@ -42,12 +47,18 @@ on run arguments
                 set tabIndex to index of tabProperties as integer
                 set tabId to id of tabProperties as text
                 set tabName to name of tabProperties as text
-                set tabSelected to selected of tabProperties as text
+                set tabSelected to (tabId is originalTabId) as text
                 set focusedTerminalId to ""
 
                 try
                     set focusedTerminalId to id of focused terminal of tabProperties as text
                 end try
+
+                set paneCount to count of terminals of currentTab
+                set paneFrames to {}
+                if paneCount > 1 then
+                    set paneFrames to my rzCapturePaneFrames(currentTab, originalTab, paneCount)
+                end if
 
                 set terminalIndex to 0
                 repeat with currentTerminal in terminals of currentTab
@@ -61,6 +72,17 @@ on run arguments
                         set terminalTty to tty of currentTerminal as text
                     end try
                     set terminalFocused to (terminalId is focusedTerminalId) as text
+                    set paneX to ""
+                    set paneY to ""
+                    set paneWidth to ""
+                    set paneHeight to ""
+                    if (count of paneFrames) is paneCount then
+                        set paneFrame to item terminalIndex of paneFrames
+                        set paneX to item 1 of paneFrame as text
+                        set paneY to item 2 of paneFrame as text
+                        set paneWidth to item 3 of paneFrame as text
+                        set paneHeight to item 4 of paneFrame as text
+                    end if
                     set scrollbackPath to ""
 
                     if captureScrollback then
@@ -88,11 +110,12 @@ on run arguments
                         end try
                     end if
 
-                    set reportText to reportText & windowIndex & separator & my cleanField(windowId) & separator & my cleanField(windowName) & separator & windowX & separator & windowY & separator & windowWidth & separator & windowHeight & separator & tabIndex & separator & my cleanField(tabId) & separator & my cleanField(tabName) & separator & tabSelected & separator & terminalIndex & separator & my cleanField(terminalId) & separator & my cleanField(terminalName) & separator & terminalFocused & separator & my cleanField(terminalDirectory) & separator & my cleanField(scrollbackPath) & separator & my cleanField(terminalTty) & linefeed
+                    set reportText to reportText & windowIndex & separator & my cleanField(windowId) & separator & my cleanField(windowName) & separator & windowX & separator & windowY & separator & windowWidth & separator & windowHeight & separator & tabIndex & separator & my cleanField(tabId) & separator & my cleanField(tabName) & separator & tabSelected & separator & terminalIndex & separator & my cleanField(terminalId) & separator & my cleanField(terminalName) & separator & terminalFocused & separator & my cleanField(terminalDirectory) & separator & my cleanField(scrollbackPath) & separator & my cleanField(terminalTty) & separator & paneX & separator & paneY & separator & paneWidth & separator & paneHeight & linefeed
                 end repeat
             end repeat
             end if
         end repeat
+        activate window initialWindow
     end tell
 
     if clipboardWasSaved then

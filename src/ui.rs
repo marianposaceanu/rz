@@ -36,7 +36,10 @@ pub fn box_text(title: &str, lines: &[String], width: usize) -> String {
     output.push('╭');
     output.push_str(&"─".repeat(width - 2));
     output.push_str("╮\n");
-    for line in wrap_line(&format!("RZ :: {title}"), inner) {
+    for line in wrap_line(
+        &format!("RZ v{} :: {title}", env!("CARGO_PKG_VERSION")),
+        inner,
+    ) {
         push_box_line(&mut output, &line, inner);
     }
     output.push('├');
@@ -97,9 +100,12 @@ fn continuation_prefix(text: &str, width: usize) -> String {
     let prefix = if label.is_some_and(|label| {
         !label.is_empty()
             && label.len() <= 11
-            && label
-                .chars()
-                .all(|character| character == ' ' || character.is_ascii_uppercase())
+            && label.chars().all(|character| {
+                character == ' '
+                    || character == '.'
+                    || character.is_ascii_digit()
+                    || character.is_ascii_uppercase()
+            })
     }) {
         " ".repeat(13)
     } else {
@@ -124,6 +130,15 @@ mod tests {
             );
             assert!(output.lines().all(|line| line.chars().count() == width));
         }
+    }
+
+    #[test]
+    fn includes_the_running_version_in_the_header() {
+        let output = box_text("WORKSPACE SAVED", &[], 92);
+        assert!(output.contains(&format!(
+            "RZ v{} :: WORKSPACE SAVED",
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     #[test]

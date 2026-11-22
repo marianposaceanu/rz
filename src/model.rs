@@ -1,5 +1,6 @@
 use std::{fmt, path::PathBuf};
 
+use crate::layout::{Layout, Rect};
 use serde::{Deserialize, Serialize};
 
 pub const SNAPSHOT_VERSION: u32 = 1;
@@ -15,6 +16,12 @@ pub struct Snapshot {
     pub timestamp: String,
     #[serde(default)]
     pub ghostty_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rz_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback_stored_bytes: Option<u64>,
     #[serde(default)]
     pub tabs_count: usize,
     #[serde(default)]
@@ -87,6 +94,8 @@ pub struct Tab {
     pub selected: bool,
     #[serde(default)]
     pub terminals: Vec<Terminal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +121,8 @@ pub struct Terminal {
     pub pi_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pi_session_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Rect>,
 }
 
 impl Terminal {
@@ -244,6 +255,7 @@ pub struct CaptureRow {
     pub terminal_index: usize,
     pub terminal_id: String,
     pub tty: String,
+    pub frame: Option<Rect>,
     pub terminal_name: String,
     pub terminal_focused: bool,
     pub working_directory: PathBuf,

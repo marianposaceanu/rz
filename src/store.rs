@@ -24,6 +24,13 @@ pub struct SnapshotEntry {
 }
 
 impl SnapshotEntry {
+    pub fn saved(path: PathBuf, snapshot: Snapshot) -> Self {
+        Self {
+            path,
+            state: Ok(snapshot),
+        }
+    }
+
     pub fn snapshot(&self) -> Result<&Snapshot> {
         self.state
             .as_ref()

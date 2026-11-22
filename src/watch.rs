@@ -375,9 +375,9 @@ fn wait_for_interval(
 }
 
 fn display_interval(seconds: u64) -> String {
-    if seconds % 3_600 == 0 {
+    if seconds.is_multiple_of(3_600) {
         format!("{}h", seconds / 3_600)
-    } else if seconds % 60 == 0 {
+    } else if seconds.is_multiple_of(60) {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")

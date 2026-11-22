@@ -56,6 +56,7 @@ rz --list 3                     # inspect snapshot number 3
 rz --clean                      # remove snapshots older than seven days
 rz --clean 30d                  # choose another maximum age
 rz --version                    # print the installed version
+rz --ui                         # open the interactive manager
 ```
 
 Start a shell-scoped automatic snapshot watcher with:
@@ -75,6 +76,28 @@ Snapshots and watcher state live under
 Every output header shows the running `rz` version. Save output and `--list`
 include snapshot sizes and total storage on disk, compact agent counts, and pane
 counts per tab. `--list NUMBER` shows the saved pane bounds and creating version.
+
+### Interactive manager
+
+`rz --ui` opens a [Ratatui](https://ratatui.rs/) workspace and storage manager,
+with navigation and styling inspired by
+[mextdisplay](https://github.com/marianposaceanu/mextdisplay).
+
+- Use the arrows or `j`/`k` to select snapshots, `/` to search names, directories,
+  agents, and session IDs, and `o` to cycle newest, largest, and name sorting.
+- Left/right arrows browse saved tabs. Wide terminals show a split-layout preview;
+  Page Up/Down scroll the details.
+- `Enter` restores into new windows. `R` replaces existing windows after a
+  confirmation. The manager exits before restoring.
+- `s` saves a named workspace with exact layouts and LZ4 scrollback.
+- `Tab` switches to storage, showing allocated disk usage and scrollback savings.
+  `d` previews deleting one snapshot; `c` previews cleanup by age across all
+  snapshots. Confirm with `y` or cancel with Escape. Agent conversation files
+  stay in their own storage locations.
+- `r` refreshes, Escape clears a search, and `q` or Ctrl+C exits.
+
+The manager needs an interactive terminal of at least 64 columns by 20 rows.
+Bare `rz` continues to restore the newest snapshot.
 
 ### Scrollback storage
 
@@ -161,7 +184,7 @@ one directory are active at the same time none of them is guessed.
 
 ## Development
 
-Build and test from source with a recent Rust toolchain:
+Build and test from source with Rust 1.88 or later:
 
 ```sh
 cargo build --release

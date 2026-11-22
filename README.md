@@ -9,7 +9,7 @@ IDs, Claude Code session IDs, and Pi sessions.
 `rz` is a small native executable written in Rust. Snapshots created by the
 earlier Ruby releases remain fully compatible.
 
-Restoring creates the complete replacement workspace before closing the old
+Direct restores create the complete replacement workspace before closing the old
 Ghostty windows. Use `--keep-existing` when you want an additive restore instead.
 
 ## Install
@@ -42,11 +42,13 @@ restore window geometry and confirm Ghostty's **Close Window?** sheet.
 ## Use
 
 ```sh
+rz                              # open the interactive manager to save or restore
+
 rz --save work                  # save a named workspace
 rz --save work --no-scrollback  # faster save without terminal history
 rz --save work --current-window # save only the front Ghostty window
 
-rz                              # restore the newest snapshot
+rz --restore                    # restore the newest snapshot directly
 rz --session work               # restore the newest snapshot named work
 rz --session work --dry-run     # preview a restore
 rz --keep-existing              # restore without closing existing windows
@@ -56,7 +58,7 @@ rz --list 3                     # inspect snapshot number 3
 rz --clean                      # remove snapshots older than seven days
 rz --clean 30d                  # choose another maximum age
 rz --version                    # print the installed version
-rz --ui                         # open the interactive manager
+rz --ui                         # explicit alias for the interactive manager
 ```
 
 Start a shell-scoped automatic snapshot watcher with:
@@ -79,8 +81,8 @@ counts per tab. `--list NUMBER` shows the saved pane bounds and creating version
 
 ### Interactive manager
 
-`rz --ui` opens a [Ratatui](https://ratatui.rs/) workspace and storage manager,
-with navigation and styling inspired by
+Running `rz` with no flags opens a [Ratatui](https://ratatui.rs/) workspace and
+storage manager, with navigation and styling inspired by
 [mextdisplay](https://github.com/marianposaceanu/mextdisplay).
 
 - Use the arrows or `j`/`k` to select snapshots, `/` to search names, directories,
@@ -97,7 +99,8 @@ with navigation and styling inspired by
 - `r` refreshes, Escape clears a search, and `q` or Ctrl+C exits.
 
 The manager needs an interactive terminal of at least 64 columns by 20 rows.
-Bare `rz` continues to restore the newest snapshot.
+`rz --ui` also opens the manager. Use `rz --restore` to restore the newest snapshot
+directly, or `rz --session NAME` to restore a named snapshot.
 
 ### Scrollback storage
 

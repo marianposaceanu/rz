@@ -108,10 +108,22 @@ impl Layout {
                     Direction::Vertical => Direction::Horizontal,
                 };
                 if !(0..=2).contains(&gap)
-                    || perpendicular.start(first_bounds) != perpendicular.start(bounds)
-                    || perpendicular.start(second_bounds) != perpendicular.start(bounds)
-                    || perpendicular.size(first_bounds) != perpendicular.size(bounds)
-                    || perpendicular.size(second_bounds) != perpendicular.size(bounds)
+                    || perpendicular
+                        .start(first_bounds)
+                        .abs_diff(perpendicular.start(bounds))
+                        > 1
+                    || perpendicular
+                        .start(second_bounds)
+                        .abs_diff(perpendicular.start(bounds))
+                        > 1
+                    || perpendicular
+                        .size(first_bounds)
+                        .abs_diff(perpendicular.size(bounds))
+                        > 1
+                    || perpendicular
+                        .size(second_bounds)
+                        .abs_diff(perpendicular.size(bounds))
+                        > 1
                 {
                     continue;
                 }
@@ -253,6 +265,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn accepts_one_point_rounding_between_stacked_and_full_height_panes() {
+        let frames = [
+            frame(1, 96, 123, 863, 451),
+            frame(2, 96, 574, 863, 452),
+            frame(3, 959, 123, 864, 904),
+        ];
+        let layout = Layout::infer(&frames).unwrap();
+        assert!(layout.valid_for(3));
+        assert_eq!(layout.description(), "left/right + top/bottom");
     }
 
     #[test]

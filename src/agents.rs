@@ -802,12 +802,7 @@ fn historical_terminal_names(
         let Ok(snapshot) = serde_json::from_str::<Snapshot>(&content) else {
             continue;
         };
-        for terminal in snapshot
-            .windows
-            .iter()
-            .flat_map(|window| &window.tabs)
-            .flat_map(|tab| &tab.terminals)
-        {
+        for terminal in snapshot.terminals() {
             let Some(session) = terminal.session() else {
                 continue;
             };

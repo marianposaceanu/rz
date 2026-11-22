@@ -116,6 +116,12 @@ fn continuation_prefix(text: &str, width: usize) -> String {
     prefix.chars().take(width.saturating_sub(1)).collect()
 }
 
+pub fn display_time(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        .unwrap_or_else(|_| value.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,13 +10,16 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Local};
 use regex::Regex;
+use tempfile::Builder;
 
 use crate::{
     agents,
     cli::{self, Command, RestoreOptions, SaveOptions},
     command, ghostty,
     model::{Agent, SNAPSHOT_VERSION, Scope, Snapshot},
-    pi, storage, ui,
+    pi, storage,
+    store::{SnapshotEntry, SnapshotStore},
+    ui::{self, display_time},
 };
 
 static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -26,7 +29,7 @@ static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone)]
 pub struct App {
     pub(crate) home: PathBuf,
-    pub(crate) snapshots_dir: PathBuf,
+    pub(crate) snapshots: SnapshotStore,
     pub(crate) watchers_dir: PathBuf,
     capture_script: PathBuf,
 }
@@ -41,7 +44,9 @@ impl App {
             .unwrap_or_else(|| home.join(".local/state/ghostty-rz"));
         let capture_script = capture_script_path()?;
         Ok(Self {
-            snapshots_dir: state_root.join("snapshots"),
+            snapshots: SnapshotStore {
+                root: state_root.join("snapshots"),
+            },
             watchers_dir: state_root.join("watchers"),
             home,
             capture_script,
@@ -52,7 +57,9 @@ impl App {
     pub(crate) fn for_test(root: &Path) -> Self {
         Self {
             home: root.join("home"),
-            snapshots_dir: root.join("snapshots"),
+            snapshots: SnapshotStore {
+                root: root.join("snapshots"),
+            },
             watchers_dir: root.join("watchers"),
             capture_script: root.join("snapshot-capture.applescript"),
         }
@@ -86,12 +93,8 @@ impl App {
                 );
                 Ok(())
             }
-            Command::Help => {
-                println!("{}", cli::USAGE);
-                Ok(())
-            }
-            Command::Version => {
-                println!("rz {}", env!("CARGO_PKG_VERSION"));
+            Command::Print(output) => {
+                print!("{output}");
                 Ok(())
             }
         }
@@ -111,27 +114,23 @@ impl App {
         };
         let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
         let snapshot_id = format!("{}_{}", options.name, timestamp);
-        fs::create_dir_all(&self.snapshots_dir)?;
-        let final_dir = self.snapshots_dir.join(&snapshot_id);
+        fs::create_dir_all(&self.snapshots.root)?;
+        let final_dir = self.snapshots.root.join(&snapshot_id);
         if final_dir.exists() {
             bail!("snapshot already exists: {snapshot_id}");
         }
-        let staging_dir = self
-            .snapshots_dir
-            .join(format!(".{snapshot_id}.{}.tmp", std::process::id()));
-        fs::create_dir_all(staging_dir.join("scrollback"))?;
-        let result = self.capture_snapshot(
+        let staging = Builder::new()
+            .prefix(".rz-")
+            .tempdir_in(&self.snapshots.root)?;
+        fs::create_dir(staging.path().join("scrollback"))?;
+        self.capture_snapshot(
             &options,
             target_window_id.as_deref(),
             &timestamp,
             &snapshot_id,
-            &staging_dir,
+            staging.path(),
             &final_dir,
-        );
-        if result.is_err() && staging_dir.starts_with(&self.snapshots_dir) {
-            let _ = fs::remove_dir_all(&staging_dir);
-        }
-        result
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -165,7 +164,7 @@ impl App {
         let (assignments, mut warnings) = agents::assign_sessions(
             &rows,
             &process_sessions,
-            &self.snapshots_dir,
+            &self.snapshots.root,
             target_window_id.is_none(),
         );
         warnings.extend(discovery_warnings);
@@ -229,9 +228,7 @@ impl App {
             snapshot.scrollback_bytes = Some(scrollback_bytes);
             snapshot.scrollback_stored_bytes = Some(scrollback_stored_bytes);
         }
-        let mut json = serde_json::to_string_pretty(&snapshot)?;
-        json.push('\n');
-        fs::write(staging_dir.join("state.json"), json)?;
+        storage::write_json(&staging_dir.join("state.json"), &snapshot)?;
         fs::rename(staging_dir, final_dir)?;
 
         let mut lines = vec![
@@ -253,7 +250,10 @@ impl App {
                 storage::format_bytes(storage::usage(final_dir)?.allocated)
             ),
         ));
-        lines.push(ui::labeled("STORAGE", self.storage_summary()?));
+        lines.push(ui::labeled(
+            "STORAGE",
+            self.storage_summary(self.snapshots.entries()?.len())?,
+        ));
         lines.push(String::new());
         lines.extend(saved_tab_lines(&snapshot));
         lines.push(String::new());
@@ -269,11 +269,12 @@ impl App {
     }
 
     fn restore(&self, options: RestoreOptions) -> Result<()> {
-        let snapshot_dir = self.resolve_snapshot(options.selector.as_deref())?;
-        let snapshot = read_snapshot(&snapshot_dir)?;
-        validate_snapshot(&snapshot)?;
+        let entry = self.snapshots.resolve(options.selector.as_deref())?;
+        let snapshot_dir = &entry.path;
+        let snapshot = entry.snapshot()?;
+        validate_snapshot(snapshot)?;
         if options.dry_run {
-            print_restore_preview(&snapshot, &snapshot_dir, options.close_existing);
+            print_restore_preview(snapshot, snapshot_dir, options.close_existing);
             return Ok(());
         }
         let ready_file = if options.close_existing {
@@ -295,8 +296,8 @@ impl App {
                 .collect()
         };
         let plan = ghostty::restore_script(
-            &snapshot,
-            &snapshot_dir,
+            snapshot,
+            snapshot_dir,
             &running_sessions,
             &self.home,
             options.close_existing,
@@ -309,7 +310,7 @@ impl App {
         let output = command::run("osascript", &["-e", &plan.script])?;
         let mut lines = vec![
             ui::labeled("SNAPSHOT", &snapshot.id),
-            ui::labeled("LAYOUT", layout_summary(&snapshot)),
+            ui::labeled("LAYOUT", layout_summary(snapshot)),
             ui::labeled(
                 "STATUS",
                 if options.close_existing {
@@ -338,13 +339,13 @@ impl App {
     }
 
     fn list(&self, number: Option<usize>) -> Result<()> {
-        let snapshots = self.snapshot_directories();
+        let snapshots = self.snapshots.entries()?;
         if snapshots.is_empty() {
             ui::print_box(
                 "SAVED WORKSPACES",
                 &[
                     "No snapshots found.".into(),
-                    ui::labeled("LOCATION", self.snapshots_dir.to_string_lossy()),
+                    ui::labeled("LOCATION", self.snapshots.root.to_string_lossy()),
                 ],
             );
             return Ok(());
@@ -359,19 +360,19 @@ impl App {
             return print_snapshot_details(number, directory);
         }
         let mut lines = vec![
-            ui::labeled("STORAGE", self.storage_summary()?),
+            ui::labeled("STORAGE", self.storage_summary(snapshots.len())?),
             String::new(),
         ];
         for (index, directory) in snapshots.iter().rev().enumerate() {
-            let snapshot = read_snapshot(directory)?;
+            let snapshot = directory.snapshot()?;
             lines.push(format!("{:02}  {}", index + 1, snapshot.id));
             lines.push(format!(
                 "    {}  |  {}  |  {}",
                 display_time(&snapshot.saved_at),
-                layout_summary(&snapshot),
-                storage::format_bytes(storage::usage(directory)?.allocated),
+                layout_summary(snapshot),
+                storage::format_bytes(storage::usage(&directory.path)?.allocated),
             ));
-            lines.push(format!("    {}", session_summary(&snapshot)));
+            lines.push(format!("    {}", session_summary(snapshot)));
             if !snapshot.warnings.is_empty() {
                 lines.push(format!(
                     "    {} warning(s); inspect with rz --list {}",
@@ -384,47 +385,43 @@ impl App {
         lines.push(String::new());
         lines.push(ui::labeled(
             "LOCATION",
-            self.snapshots_dir.to_string_lossy(),
+            self.snapshots.root.to_string_lossy(),
         ));
         ui::print_box("SAVED WORKSPACES", &lines);
         Ok(())
     }
 
-    fn storage_summary(&self) -> Result<String> {
-        let size = if self.snapshots_dir.exists() {
-            storage::usage(&self.snapshots_dir)?.allocated
-        } else {
-            0
-        };
+    fn storage_summary(&self, count: usize) -> Result<String> {
         Ok(format!(
             "{} | {} on disk",
-            counted(self.snapshot_directories().len(), "snapshot"),
-            storage::format_bytes(size)
+            counted(count, "snapshot"),
+            storage::format_bytes(self.snapshots.usage()?.allocated)
         ))
     }
 
     fn clean(&self, age_seconds: u64) -> Result<()> {
-        let cutoff = Local::now() - Duration::seconds(i64::try_from(age_seconds)?);
+        let age = Duration::try_seconds(i64::try_from(age_seconds)?)
+            .context("cleanup age is too large")?;
+        let cutoff = Local::now()
+            .checked_sub_signed(age)
+            .context("cleanup cutoff is out of range")?;
         let mut removed = Vec::new();
         let mut kept = 0;
         let mut warnings = Vec::new();
-        for directory in self.snapshot_directories() {
+        for entry in self.snapshots.entries()? {
             let result = (|| -> Result<()> {
-                let snapshot = read_snapshot(&directory)?;
+                let snapshot = entry.snapshot()?;
                 let saved_at = DateTime::parse_from_rfc3339(&snapshot.saved_at)?;
                 if saved_at < cutoff {
-                    self.remove_snapshot_directory(&directory)?;
-                    removed.push((snapshot.id, saved_at));
+                    self.snapshots.remove(&entry.path)?;
+                    removed.push((snapshot.id.clone(), saved_at));
                 } else {
                     kept += 1;
                 }
                 Ok(())
             })();
             if let Err(error) = result {
-                warnings.push(format!(
-                    "kept {}: {error}",
-                    directory.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                warnings.push(format!("kept {}: {error}", entry.id()));
             }
         }
         let mut lines = vec![
@@ -432,7 +429,7 @@ impl App {
             ui::labeled("CUTOFF", cutoff.to_rfc3339()),
             ui::labeled("REMOVED", format!("{} snapshot(s)", removed.len())),
             ui::labeled("KEPT", format!("{kept} newer snapshot(s)")),
-            ui::labeled("LOCATION", self.snapshots_dir.to_string_lossy()),
+            ui::labeled("LOCATION", self.snapshots.root.to_string_lossy()),
         ];
         lines.extend(removed.into_iter().map(|(id, saved_at)| {
             ui::labeled(
@@ -447,78 +444,6 @@ impl App {
         );
         ui::print_box("SNAPSHOTS CLEANED", &lines);
         Ok(())
-    }
-
-    pub(crate) fn snapshot_directories(&self) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(&self.snapshots_dir) else {
-            return Vec::new();
-        };
-        let mut directories = entries
-            .flatten()
-            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-            .map(|entry| entry.path())
-            .filter(|directory| directory.is_dir() && directory.join("state.json").is_file())
-            .collect::<Vec<_>>();
-        directories.sort_by_key(|directory| {
-            read_snapshot(directory)
-                .map(|snapshot| (snapshot.saved_at, snapshot.id))
-                .unwrap_or_else(|_| {
-                    (
-                        String::new(),
-                        directory
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                })
-        });
-        directories
-    }
-
-    fn remove_snapshot_directory(&self, directory: &Path) -> Result<()> {
-        let parent = directory.parent();
-        let metadata = fs::symlink_metadata(directory)?;
-        if parent != Some(self.snapshots_dir.as_path()) || metadata.file_type().is_symlink() {
-            bail!("refusing to remove unsafe snapshot path {directory:?}");
-        }
-        fs::remove_dir_all(directory)?;
-        Ok(())
-    }
-
-    fn resolve_snapshot(&self, selector: Option<&str>) -> Result<PathBuf> {
-        let snapshots = self.snapshot_directories();
-        if snapshots.is_empty() {
-            bail!("no saved sessions; create one with rz --save NAME");
-        }
-        let Some(selector) = selector else {
-            return Ok(snapshots.last().expect("non-empty snapshots").clone());
-        };
-        if let Some(exact) = snapshots
-            .iter()
-            .find(|directory| directory.file_name().is_some_and(|name| name == selector))
-        {
-            return Ok(exact.clone());
-        }
-        let matching = snapshots.iter().rfind(|directory| {
-            read_snapshot(directory)
-                .is_ok_and(|snapshot| snapshot.name == selector || snapshot.timestamp == selector)
-        });
-        matching
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no saved session matches {selector:?}; run rz --list"))
-    }
-
-    pub(crate) fn newest_snapshot_id(&self, name: &str) -> Option<String> {
-        self.snapshot_directories()
-            .iter()
-            .rev()
-            .find_map(|directory| {
-                read_snapshot(directory)
-                    .ok()
-                    .filter(|snapshot| snapshot.name == name)
-                    .map(|snapshot| snapshot.id)
-            })
     }
 }
 
@@ -536,11 +461,6 @@ fn capture_script_path() -> Result<PathBuf> {
     Ok(Path::new(env!("CARGO_MANIFEST_DIR")).join("libexec/snapshot-capture.applescript"))
 }
 
-fn read_snapshot(directory: &Path) -> Result<Snapshot> {
-    let content = fs::read_to_string(directory.join("state.json"))?;
-    serde_json::from_str(&content).context("invalid snapshot state")
-}
-
 fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     if snapshot.version != SNAPSHOT_VERSION {
         bail!("unsupported snapshot version {}", snapshot.version);
@@ -551,9 +471,10 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
-    let snapshot = read_snapshot(directory)?;
-    validate_snapshot(&snapshot)?;
+fn print_snapshot_details(number: usize, entry: &SnapshotEntry) -> Result<()> {
+    let snapshot = entry.snapshot()?;
+    let directory = &entry.path;
+    validate_snapshot(snapshot)?;
     let scope = match &snapshot.scope {
         Scope::Window { window_id } => format!("Ghostty window {window_id}"),
         Scope::AllWindows => "all Ghostty windows".into(),
@@ -570,9 +491,9 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
             ),
         ),
         ui::labeled("SCOPE", scope),
-        ui::labeled("LAYOUT", layout_summary(&snapshot)),
+        ui::labeled("LAYOUT", layout_summary(snapshot)),
     ];
-    lines.extend(content_lines(&snapshot));
+    lines.extend(content_lines(snapshot));
     lines.push(ui::labeled(
         "SIZE",
         format!(
@@ -646,17 +567,11 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
                         ),
                     ));
                 }
-                if let Some(id) = &terminal.codex_session_id {
-                    lines.push(ui::labeled("CODEX", id));
-                }
-                if let Some(id) = &terminal.amp_thread_id {
-                    lines.push(ui::labeled("AMP", id));
-                }
-                if let Some(id) = &terminal.claude_session_id {
-                    lines.push(ui::labeled("CLAUDE", id));
-                }
-                if let Some(id) = &terminal.pi_session_id {
-                    lines.push(ui::labeled("PI", id));
+                if let Some(session) = terminal.session() {
+                    lines.push(ui::labeled(
+                        &session.agent.label().to_ascii_uppercase(),
+                        session.id,
+                    ));
                 }
             }
         }
@@ -674,29 +589,6 @@ fn print_snapshot_details(number: usize, directory: &Path) -> Result<()> {
 }
 
 fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: bool) {
-    let sessions = snapshot
-        .windows
-        .iter()
-        .flat_map(|window| &window.tabs)
-        .flat_map(|tab| &tab.terminals)
-        .filter_map(|terminal| terminal.session())
-        .collect::<Vec<_>>();
-    let codex = sessions
-        .iter()
-        .filter(|session| session.agent == Agent::Codex)
-        .collect::<Vec<_>>();
-    let amp = sessions
-        .iter()
-        .filter(|session| session.agent == Agent::Amp)
-        .collect::<Vec<_>>();
-    let claude = sessions
-        .iter()
-        .filter(|session| session.agent == Agent::Claude)
-        .collect::<Vec<_>>();
-    let pi = sessions
-        .iter()
-        .filter(|session| session.agent == Agent::Pi)
-        .collect::<Vec<_>>();
     let mut lines = vec![
         ui::labeled("STATUS", "Dry run - Ghostty will not be changed"),
         ui::labeled("SNAPSHOT", &snapshot.id),
@@ -717,57 +609,20 @@ fn print_restore_preview(snapshot: &Snapshot, directory: &Path, close_existing: 
                 "Existing Ghostty windows will remain open"
             },
         ),
-        ui::labeled(
-            "CODEX",
-            if codex.is_empty() {
-                "none".into()
-            } else {
-                format!("{} session(s)", codex.len())
-            },
-        ),
     ];
-    lines.extend(
-        codex
-            .iter()
-            .map(|session| format!("              {}", session.id)),
-    );
-    lines.push(ui::labeled(
-        "AMP",
-        if amp.is_empty() {
+    for agent in Agent::ALL {
+        let sessions = snapshot
+            .sessions()
+            .filter(|session| session.agent == agent)
+            .collect::<Vec<_>>();
+        let count = if sessions.is_empty() {
             "none".into()
         } else {
-            format!("{} thread(s)", amp.len())
-        },
-    ));
-    lines.extend(
-        amp.iter()
-            .map(|session| format!("              {}", session.id)),
-    );
-    lines.push(ui::labeled(
-        "CLAUDE",
-        if claude.is_empty() {
-            "none".into()
-        } else {
-            format!("{} session(s)", claude.len())
-        },
-    ));
-    lines.extend(
-        claude
-            .iter()
-            .map(|session| format!("              {}", session.id)),
-    );
-    lines.push(ui::labeled(
-        "PI",
-        if pi.is_empty() {
-            "none".into()
-        } else {
-            format!("{} session(s)", pi.len())
-        },
-    ));
-    lines.extend(
-        pi.iter()
-            .map(|session| format!("              {}", session.id)),
-    );
+            counted(sessions.len(), agent.unit())
+        };
+        lines.push(ui::labeled(&agent.label().to_ascii_uppercase(), count));
+        lines.extend(sessions.iter().map(|session| ui::labeled("", session.id)));
+    }
     lines.push(ui::labeled("LOCATION", directory.to_string_lossy()));
     lines.extend(
         snapshot
@@ -788,16 +643,8 @@ fn layout_summary(snapshot: &Snapshot) -> String {
     format!(
         "{} | {} | {}",
         counted(snapshot.windows.len(), "window"),
-        counted(snapshot.tabs_count, "tab"),
-        counted(
-            snapshot
-                .windows
-                .iter()
-                .flat_map(|window| &window.tabs)
-                .map(|tab| tab.terminals.len())
-                .sum::<usize>(),
-            "pane"
-        )
+        counted(snapshot.tabs().count(), "tab"),
+        counted(snapshot.terminals().count(), "pane")
     )
 }
 
@@ -809,7 +656,7 @@ fn saved_tab_lines(snapshot: &Snapshot) -> Vec<String> {
                 &format!("TAB {}.{}", window.index, tab.index),
                 untitled(&tab.name),
             ));
-            let agents = [Agent::Codex, Agent::Amp, Agent::Claude, Agent::Pi]
+            let agents = Agent::ALL
                 .into_iter()
                 .filter_map(|agent| {
                     let count = tab
@@ -851,14 +698,11 @@ fn counted(count: usize, noun: &str) -> String {
 }
 
 fn session_summary(snapshot: &Snapshot) -> String {
-    [Agent::Codex, Agent::Amp, Agent::Claude, Agent::Pi]
+    Agent::ALL
         .into_iter()
         .map(|agent| {
             let count = snapshot
-                .windows
-                .iter()
-                .flat_map(|window| &window.tabs)
-                .flat_map(|tab| &tab.terminals)
+                .terminals()
                 .filter(|terminal| {
                     terminal
                         .session()
@@ -873,10 +717,7 @@ fn session_summary(snapshot: &Snapshot) -> String {
 
 fn content_lines(snapshot: &Snapshot) -> Vec<String> {
     let files = snapshot
-        .windows
-        .iter()
-        .flat_map(|window| &window.tabs)
-        .flat_map(|tab| &tab.terminals)
+        .terminals()
         .filter(|terminal| terminal.scrollback_file.is_some())
         .count();
     let scrollback = if !snapshot.scrollback_captured {
@@ -909,12 +750,6 @@ fn content_lines(snapshot: &Snapshot) -> Vec<String> {
         ui::labeled("SESSIONS", session_summary(snapshot)),
         ui::labeled("SCROLLBACK", scrollback),
     ]
-}
-
-fn display_time(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value)
-        .map(|time| time.format("%Y-%m-%d %H:%M:%S %:z").to_string())
-        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn human_duration(seconds: u64) -> String {
@@ -972,7 +807,7 @@ mod tests {
     fn compact_summary_shows_all_agents_and_precise_compression_savings() {
         let temp = TempDir::new().unwrap();
         write_snapshot(temp.path(), "work_1", "2026-11-22T13:00:00Z");
-        let mut snapshot = read_snapshot(temp.path()).unwrap();
+        let mut snapshot = SnapshotStore::read(temp.path()).unwrap();
         snapshot.scrollback_captured = true;
         snapshot.scrollback_bytes = Some(1_000_000);
         snapshot.scrollback_stored_bytes = Some(1_000);
@@ -987,7 +822,7 @@ mod tests {
     fn reads_version_one_ruby_snapshots() {
         let temp = TempDir::new().unwrap();
         write_snapshot(temp.path(), "work_1", "2026-07-20T12:00:00+03:00");
-        let snapshot = read_snapshot(temp.path()).unwrap();
+        let snapshot = SnapshotStore::read(temp.path()).unwrap();
         validate_snapshot(&snapshot).unwrap();
         assert_eq!(snapshot.id, "work_1");
         assert_eq!(
@@ -1009,18 +844,18 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let app = App::for_test(temp.path());
         write_snapshot(
-            &app.snapshots_dir.join("new"),
+            &app.snapshots.root.join("new"),
             "new",
             "2026-07-21T12:00:00+03:00",
         );
         write_snapshot(
-            &app.snapshots_dir.join("old"),
+            &app.snapshots.root.join("old"),
             "old",
             "2026-07-20T12:00:00+03:00",
         );
-        let directories = app.snapshot_directories();
-        assert_eq!(directories[0].file_name().unwrap(), "old");
-        assert_eq!(directories[1].file_name().unwrap(), "new");
+        let directories = app.snapshots.entries().unwrap();
+        assert_eq!(directories[0].path.file_name().unwrap(), "old");
+        assert_eq!(directories[1].path.file_name().unwrap(), "new");
     }
 
     #[test]
@@ -1028,11 +863,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
         let app = App::for_test(temp.path());
-        fs::create_dir_all(&app.snapshots_dir).unwrap();
+        fs::create_dir_all(&app.snapshots.root).unwrap();
         write_snapshot(external.path(), "external", "2026-07-01T12:00:00+03:00");
-        let link = app.snapshots_dir.join("external");
+        let link = app.snapshots.root.join("external");
         symlink(external.path(), &link).unwrap();
-        let error = app.remove_snapshot_directory(&link).unwrap_err();
+        let error = app.snapshots.remove(&link).unwrap_err();
         assert!(
             error
                 .to_string()

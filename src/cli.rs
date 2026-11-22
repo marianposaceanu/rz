@@ -1,23 +1,70 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail};
+use clap::{ArgGroup, Parser, error::ErrorKind};
 
-pub const USAGE: &str = "Usage:
-  rz --save NAME
-  rz --save NAME [--no-scrollback] [--current-window]
-  rz --watch NAME --every INTERVAL [--current-window | --all-windows]
-  rz --watch-status
-  rz --watch-stop
-  rz --clean [AGE]
-  rz [--keep-existing]
-  rz --session NAME_OR_TIMESTAMP [--keep-existing] [--dry-run]
-  rz --dry-run [--keep-existing]
-  rz --list [NUMBER]
-  rz --install-pi-extension
-  rz --version";
+pub const MINIMUM_WATCH_INTERVAL: u64 = 10;
 
-const MINIMUM_WATCH_INTERVAL: u64 = 10;
-const DEFAULT_CLEAN_AGE: u64 = 7 * 24 * 60 * 60;
+#[derive(Debug, Parser)]
+#[command(name = "rz", version, about, no_binary_name = true)]
+#[command(group(ArgGroup::new("action").args([
+    "save", "watch", "watch_status", "watch_stop", "clean", "list",
+    "install_pi_extension", "replay_scrollback", "watch_worker",
+])))]
+#[command(group(ArgGroup::new("restore").args([
+    "session", "keep_existing", "dry_run",
+]).multiple(true).conflicts_with("action")))]
+#[command(group(ArgGroup::new("window_action").args(["save", "watch"])))]
+struct Cli {
+    /// Save a named Ghostty workspace
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
+    /// Skip terminal history when saving
+    #[arg(long, requires = "save")]
+    no_scrollback: bool,
+    /// Save only the front window (the default for watchers)
+    #[arg(long, requires = "window_action", conflicts_with_all = ["all_windows", "window_id"])]
+    current_window: bool,
+    #[arg(long, requires = "save", hide = true)]
+    window_id: Option<String>,
+    /// Start a watcher that stops when this shell exits
+    #[arg(long, value_name = "NAME", requires = "every")]
+    watch: Option<String>,
+    /// Watch interval, such as 30s, 15m, or 1h
+    #[arg(long, requires = "watch", value_parser = parse_interval)]
+    every: Option<u64>,
+    /// Watch all Ghostty windows
+    #[arg(long, requires = "watch")]
+    all_windows: bool,
+    /// Show this shell's watcher
+    #[arg(long)]
+    watch_status: bool,
+    /// Stop this shell's watcher
+    #[arg(long)]
+    watch_stop: bool,
+    /// Remove snapshots older than AGE (default: 7d)
+    #[arg(long, num_args = 0..=1, default_missing_value = "7d", value_parser = parse_age)]
+    clean: Option<u64>,
+    /// List snapshots, or inspect a number from the list
+    #[arg(long, num_args = 0..=1, value_name = "NUMBER", value_parser = parse_number)]
+    list: Option<Option<usize>>,
+    /// Restore the newest snapshot with this name, timestamp, or ID
+    #[arg(long, value_name = "SELECTOR")]
+    session: Option<String>,
+    /// Leave existing windows open after restoring
+    #[arg(long)]
+    keep_existing: bool,
+    /// Preview a restore without changing Ghostty
+    #[arg(long)]
+    dry_run: bool,
+    /// Install or update the Pi session tracker
+    #[arg(long)]
+    install_pi_extension: bool,
+    #[arg(long, hide = true)]
+    replay_scrollback: Option<PathBuf>,
+    #[arg(long, num_args = 8, hide = true)]
+    watch_worker: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -30,9 +77,8 @@ pub enum Command {
     WatchStop,
     WatchWorker(WorkerOptions),
     InstallPiExtension,
-    ReplayScrollback(std::path::PathBuf),
-    Help,
-    Version,
+    ReplayScrollback(PathBuf),
+    Print(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,225 +122,109 @@ pub struct WorkerOptions {
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
-    let args = args
-        .into_iter()
-        .map(|arg| {
-            arg.into_string()
-                .map_err(|_| anyhow::anyhow!("arguments must be valid UTF-8"))
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            return Ok(Command::Print(error.to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(if let Some(name) = cli.save {
+        Command::Save(SaveOptions {
+            name,
+            capture_scrollback: !cli.no_scrollback,
+            current_window: cli.current_window,
+            window_id: cli.window_id,
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    match args.first().map(String::as_str) {
-        Some("--save") => parse_save(&args[1..]).map(Command::Save),
-        Some("--watch") => parse_watch(&args[1..]).map(Command::StartWatch),
-        Some("--watch-status") if args.len() == 1 => Ok(Command::WatchStatus),
-        Some("--watch-stop") if args.len() == 1 => Ok(Command::WatchStop),
-        Some("--watch-worker") => parse_worker(&args[1..]).map(Command::WatchWorker),
-        Some("--clean") => parse_clean(&args[1..]),
-        Some("--list") => parse_list(&args[1..]).map(Command::List),
-        Some("--install-pi-extension") if args.len() == 1 => Ok(Command::InstallPiExtension),
-        Some("--replay-scrollback") if args.len() == 2 => {
-            Ok(Command::ReplayScrollback(args[1].clone().into()))
-        }
-        Some("--help") if args.len() == 1 => Ok(Command::Help),
-        Some("--version" | "-V") if args.len() == 1 => Ok(Command::Version),
-        _ => parse_restore(&args).map(Command::Restore),
-    }
-}
-
-fn parse_save(args: &[String]) -> Result<SaveOptions> {
-    let Some(name) = args.first() else {
-        bail!("missing snapshot name");
-    };
-    let mut options = SaveOptions {
-        name: name.clone(),
-        capture_scrollback: true,
-        current_window: false,
-        window_id: None,
-    };
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--no-scrollback" => options.capture_scrollback = false,
-            "--current-window" => options.current_window = true,
-            "--window-id" => {
-                index += 1;
-                options.window_id = Some(
-                    args.get(index)
-                        .ok_or_else(|| anyhow::anyhow!("missing value for --window-id"))?
-                        .clone(),
-                );
-            }
-            option => bail!("unknown save option {option:?}"),
-        }
-        index += 1;
-    }
-    if options.current_window && options.window_id.is_some() {
-        bail!("use either --current-window or --window-id, not both");
-    }
-    Ok(options)
-}
-
-fn parse_restore(args: &[String]) -> Result<RestoreOptions> {
-    let mut options = RestoreOptions {
-        selector: None,
-        dry_run: false,
-        close_existing: true,
-    };
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--session" => {
-                if options.selector.is_some() {
-                    bail!("use --session only once");
-                }
-                index += 1;
-                options.selector = Some(
-                    args.get(index)
-                        .ok_or_else(|| anyhow::anyhow!("missing value for --session"))?
-                        .clone(),
-                );
-            }
-            "--dry-run" => options.dry_run = true,
-            "--keep-existing" => options.close_existing = false,
-            option => bail!("unknown restore option {option:?}"),
-        }
-        index += 1;
-    }
-    Ok(options)
-}
-
-fn parse_watch(args: &[String]) -> Result<WatchOptions> {
-    let Some(name) = args.first() else {
-        bail!("missing watcher snapshot name");
-    };
-    let mut interval_seconds = None;
-    let mut scope = WatchScope::CurrentWindow;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--every" => {
-                index += 1;
-                interval_seconds =
-                    Some(parse_interval(args.get(index).ok_or_else(|| {
-                        anyhow::anyhow!("missing value for --every")
-                    })?)?);
-            }
-            "--current-window" => scope = WatchScope::CurrentWindow,
-            "--all-windows" => scope = WatchScope::AllWindows,
-            option => bail!("unknown watcher option {option:?}"),
-        }
-        index += 1;
-    }
-    Ok(WatchOptions {
-        name: name.clone(),
-        interval_seconds: interval_seconds
-            .ok_or_else(|| anyhow::anyhow!("missing --every INTERVAL"))?,
-        scope,
+    } else if let Some(name) = cli.watch {
+        Command::StartWatch(WatchOptions {
+            name,
+            interval_seconds: cli.every.expect("Clap requires --every"),
+            scope: if cli.all_windows {
+                WatchScope::AllWindows
+            } else {
+                WatchScope::CurrentWindow
+            },
+        })
+    } else if cli.watch_status {
+        Command::WatchStatus
+    } else if cli.watch_stop {
+        Command::WatchStop
+    } else if let Some(args) = cli.watch_worker {
+        Command::WatchWorker(WorkerOptions {
+            token: args[0].clone(),
+            name: args[1].clone(),
+            interval_seconds: args[2].parse()?,
+            owner_pid: args[3].parse()?,
+            owner_started_at: args[4].clone(),
+            scope: match args[5].as_str() {
+                "current-window" => WatchScope::CurrentWindow,
+                "all-windows" => WatchScope::AllWindows,
+                _ => bail!("invalid watcher scope"),
+            },
+            window_id: (args[6] != "-").then(|| args[6].clone()),
+            state_path: args[7].clone(),
+        })
+    } else if let Some(age_seconds) = cli.clean {
+        Command::Clean { age_seconds }
+    } else if let Some(number) = cli.list {
+        Command::List(number)
+    } else if cli.install_pi_extension {
+        Command::InstallPiExtension
+    } else if let Some(path) = cli.replay_scrollback {
+        Command::ReplayScrollback(path)
+    } else {
+        Command::Restore(RestoreOptions {
+            selector: cli.session,
+            dry_run: cli.dry_run,
+            close_existing: !cli.keep_existing,
+        })
     })
 }
 
-fn parse_worker(args: &[String]) -> Result<WorkerOptions> {
-    if args.len() != 8 {
-        bail!("malformed watcher worker arguments");
+fn parse_number(value: &str) -> Result<usize> {
+    let number = value.parse::<usize>()?;
+    if number == 0 || value.starts_with('0') {
+        bail!("use a number shown by rz --list");
     }
-    let interval_seconds = args[2].parse()?;
-    let owner_pid = args[3].parse()?;
-    let scope = match args[5].as_str() {
-        "current-window" => WatchScope::CurrentWindow,
-        "all-windows" => WatchScope::AllWindows,
-        _ => bail!("invalid watcher scope"),
-    };
-    Ok(WorkerOptions {
-        token: args[0].clone(),
-        name: args[1].clone(),
-        interval_seconds,
-        owner_pid,
-        owner_started_at: args[4].clone(),
-        scope,
-        window_id: (args[6] != "-").then(|| args[6].clone()),
-        state_path: args[7].clone(),
-    })
+    Ok(number)
 }
 
-fn parse_list(args: &[String]) -> Result<Option<usize>> {
-    if args.is_empty() {
-        return Ok(None);
+fn parse_duration(value: &str, minimum: u64) -> Result<u64> {
+    // Retain legacy spellings such as 2.days and bare seconds.
+    let value = value.trim().to_ascii_lowercase();
+    let split = value
+        .find(|character: char| character.is_ascii_alphabetic())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number = number.strip_suffix('.').unwrap_or(number);
+    let normalized = format!(
+        "{}{number}{}",
+        if number.starts_with('.') { "0" } else { "" },
+        if unit.is_empty() { "s" } else { unit }
+    );
+    let duration = humantime::parse_duration(&normalized)?;
+    let seconds = duration
+        .as_secs()
+        .checked_add(u64::from(duration.subsec_nanos() >= 500_000_000))
+        .ok_or_else(|| anyhow::anyhow!("duration is too large"))?;
+    if seconds < minimum || duration > Duration::from_secs(i64::MAX as u64) {
+        bail!("duration must be at least {minimum} seconds and fit in a signed 64-bit value");
     }
-    if args.len() != 1 || args[0].starts_with('0') {
-        bail!("use rz --list [NUMBER] with a number shown by rz --list");
-    }
-    let number = args[0]
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("use rz --list [NUMBER] with a number shown by rz --list"))?;
-    if number == 0 {
-        bail!("use rz --list [NUMBER] with a number shown by rz --list");
-    }
-    Ok(Some(number))
-}
-
-fn parse_clean(args: &[String]) -> Result<Command> {
-    if args.len() > 1 {
-        bail!("use rz --clean [AGE] with a single age such as 7d or 2.weeks");
-    }
-    let age_seconds = match args.first() {
-        Some(value) => parse_age(value)?,
-        None => DEFAULT_CLEAN_AGE,
-    };
-    Ok(Command::Clean { age_seconds })
+    Ok(seconds)
 }
 
 fn parse_interval(value: &str) -> Result<u64> {
-    let split = value
-        .char_indices()
-        .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
-        .map_or(value.len(), |(index, _)| index);
-    let (number, unit) = value.split_at(split);
-    let multiplier = match unit.to_ascii_lowercase().as_str() {
-        "" | "s" => 1.0,
-        "m" => 60.0,
-        "h" => 3_600.0,
-        _ => bail!(
-            "invalid interval {value:?}; use seconds, minutes, or hours such as 30s, 15m, or 1h"
-        ),
-    };
-    let seconds = parse_positive_float(number, "interval", value, multiplier)?;
-    if seconds < MINIMUM_WATCH_INTERVAL {
-        bail!("watch interval must be at least {MINIMUM_WATCH_INTERVAL} seconds");
-    }
-    Ok(seconds)
+    parse_duration(value, MINIMUM_WATCH_INTERVAL)
 }
 
 fn parse_age(value: &str) -> Result<u64> {
-    let split = value
-        .char_indices()
-        .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
-        .map_or(value.len(), |(index, _)| index);
-    let (number, raw_unit) = value.split_at(split);
-    let unit = raw_unit.trim_start_matches('.').to_ascii_lowercase();
-    let multiplier = match unit.as_str() {
-        "" | "s" | "second" | "seconds" => 1.0,
-        "m" | "minute" | "minutes" => 60.0,
-        "h" | "hour" | "hours" => 3_600.0,
-        "d" | "day" | "days" => 86_400.0,
-        "w" | "week" | "weeks" => 604_800.0,
-        _ => bail!("invalid cleanup age {value:?}; use values such as 12h, 7d, 7.days, or 2.weeks"),
-    };
-    let seconds = parse_positive_float(number, "cleanup age", value, multiplier)?;
-    if seconds < 1 {
-        bail!("cleanup age must be at least one second");
-    }
-    Ok(seconds)
-}
-
-fn parse_positive_float(number: &str, kind: &str, original: &str, multiplier: f64) -> Result<u64> {
-    let parsed = number.parse::<f64>().map_err(|_| {
-        anyhow::anyhow!("invalid {kind} {original:?}; expected a positive number and unit")
-    })?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        bail!("invalid {kind} {original:?}; expected a positive number and unit");
-    }
-    Ok((parsed * multiplier).round() as u64)
+    parse_duration(value, 1)
 }
 
 #[cfg(test)]
@@ -335,11 +265,7 @@ mod tests {
             "window-1",
         ]))
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("either --current-window or --window-id")
-        );
+        assert!(error.to_string().contains("cannot be used with"));
     }
 
     #[test]
@@ -380,13 +306,71 @@ mod tests {
         assert_eq!(parse_age("2.days").unwrap(), 172_800);
         assert_eq!(parse_age("2weeks").unwrap(), 1_209_600);
         assert_eq!(parse_age("12h").unwrap(), 43_200);
+        assert_eq!(parse_age("1.5.hours").unwrap(), 5_400);
+        assert_eq!(parse_age(".5h").unwrap(), 1_800);
+        assert_eq!(parse_age("90").unwrap(), 90);
+        assert_eq!(parse_age("1.5").unwrap(), 2);
+        assert_eq!(parse_age("1h 30m").unwrap(), 5_400);
         assert!(parse_age("last-week").is_err());
+        assert!(parse_age("0").is_err());
+        assert!(parse_age("-1h").is_err());
+        assert!(parse_age("NaN").is_err());
     }
 
     #[test]
     fn validates_list_number() {
-        assert_eq!(parse_list(&[]).unwrap(), None);
-        assert_eq!(parse_list(&["12".into()]).unwrap(), Some(12));
-        assert!(parse_list(&["0".into()]).is_err());
+        assert_eq!(parse(strings(&["--list"])).unwrap(), Command::List(None));
+        assert_eq!(
+            parse(strings(&["--list", "12"])).unwrap(),
+            Command::List(Some(12))
+        );
+        for value in ["0", "01", "nope", "-1"] {
+            assert!(parse(strings(&["--list", value])).is_err());
+        }
+    }
+
+    #[test]
+    fn preserves_default_restore_help_and_internal_worker_protocol() {
+        assert_eq!(
+            parse(strings(&[])).unwrap(),
+            Command::Restore(RestoreOptions {
+                selector: None,
+                dry_run: false,
+                close_existing: true,
+            })
+        );
+        assert!(
+            matches!(parse(strings(&["--help"])).unwrap(), Command::Print(output) if output.contains("--save") && !output.contains("--watch-worker"))
+        );
+        assert!(
+            matches!(parse(strings(&["-V"])).unwrap(), Command::Print(output) if output.trim() == concat!("rz ", env!("CARGO_PKG_VERSION")))
+        );
+        assert!(
+            matches!(parse(strings(&["--watch-worker", "token", "work", "900", "42", "Sun Nov 22 10:00:00 2026", "all-windows", "-", "/tmp/state.json"])).unwrap(), Command::WatchWorker(options) if options.window_id.is_none() && options.owner_pid == 42)
+        );
+        assert!(parse(strings(&["--watch-worker", "too", "few"])).is_err());
+    }
+
+    #[test]
+    fn rejects_conflicting_modes_and_orphaned_options() {
+        for values in [
+            vec!["--save", "work", "--dry-run"],
+            vec!["--list", "--session", "work"],
+            vec!["--clean", "--watch-stop"],
+            vec!["--no-scrollback"],
+            vec!["--every", "15m"],
+            vec!["--current-window"],
+            vec!["--watch", "work"],
+            vec![
+                "--watch",
+                "work",
+                "--every",
+                "15m",
+                "--current-window",
+                "--all-windows",
+            ],
+        ] {
+            assert!(parse(strings(&values)).is_err(), "{values:?}");
+        }
     }
 }

@@ -7,6 +7,7 @@ mod layout;
 mod model;
 mod pi;
 mod storage;
+mod store;
 mod ui;
 mod watch;
 

@@ -26,7 +26,9 @@ use crate::{
 
 pub fn run(app: &App) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("rz --ui needs an interactive terminal");
+        bail!(
+            "the workspace manager needs an interactive terminal; use rz --save NAME or rz --restore for direct commands"
+        );
     }
     let mut manager = Manager::new(Catalog::load(&app.snapshots)?);
     let restore = ratatui::run(|terminal| manager.run(terminal, app))?;
@@ -175,7 +177,7 @@ impl Manager {
             query: String::new(),
             searching: false,
             modal: None,
-            notice: "Select a snapshot to inspect its sessions and layout.".into(),
+            notice: "Enter: restore selected snapshot · s: save a new workspace".into(),
             error: false,
             busy: false,
             quit_after_job: false,

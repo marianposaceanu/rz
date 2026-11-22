@@ -11,14 +11,17 @@ pub const MINIMUM_WATCH_INTERVAL: u64 = 10;
     "save", "watch", "watch_status", "watch_stop", "clean", "list",
     "install_pi_extension", "replay_scrollback", "watch_worker", "ui",
 ])))]
-#[command(group(ArgGroup::new("restore").args([
-    "session", "keep_existing", "dry_run",
+#[command(group(ArgGroup::new("restore_options").args([
+    "restore", "session", "keep_existing", "dry_run",
 ]).multiple(true).conflicts_with("action")))]
 #[command(group(ArgGroup::new("window_action").args(["save", "watch"])))]
 struct Cli {
     /// Open the interactive workspace and storage manager
     #[arg(long)]
     ui: bool,
+    /// Restore directly, using the newest snapshot unless --session is set
+    #[arg(long)]
+    restore: bool,
     /// Save a named Ghostty workspace
     #[arg(long, value_name = "NAME")]
     save: Option<String>,
@@ -184,12 +187,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         Command::InstallPiExtension
     } else if let Some(path) = cli.replay_scrollback {
         Command::ReplayScrollback(path)
-    } else {
+    } else if cli.restore || cli.session.is_some() || cli.keep_existing || cli.dry_run {
         Command::Restore(RestoreOptions {
             selector: cli.session,
             dry_run: cli.dry_run,
             close_existing: !cli.keep_existing,
         })
+    } else {
+        Command::Ui
     })
 }
 
@@ -336,15 +341,30 @@ mod tests {
     }
 
     #[test]
-    fn preserves_default_restore_help_and_internal_worker_protocol() {
+    fn opens_manager_by_default_and_keeps_direct_restore_explicit() {
+        assert_eq!(parse(strings(&[])).unwrap(), Command::Ui);
+        assert_eq!(parse(strings(&["--ui"])).unwrap(), Command::Ui);
         assert_eq!(
-            parse(strings(&[])).unwrap(),
+            parse(strings(&["--restore"])).unwrap(),
             Command::Restore(RestoreOptions {
                 selector: None,
                 dry_run: false,
                 close_existing: true,
             })
         );
+        assert!(
+            matches!(parse(strings(&["--restore", "--keep-existing"])).unwrap(), Command::Restore(options) if !options.close_existing)
+        );
+        assert!(
+            matches!(parse(strings(&["--dry-run"])).unwrap(), Command::Restore(options) if options.dry_run)
+        );
+        assert!(
+            matches!(parse(strings(&["--keep-existing"])).unwrap(), Command::Restore(options) if !options.close_existing)
+        );
+    }
+
+    #[test]
+    fn preserves_help_and_internal_worker_protocol() {
         assert!(
             matches!(parse(strings(&["--help"])).unwrap(), Command::Print(output) if output.contains("--save") && !output.contains("--watch-worker"))
         );
@@ -367,6 +387,8 @@ mod tests {
             vec!["--every", "15m"],
             vec!["--current-window"],
             vec!["--ui", "--session", "work"],
+            vec!["--ui", "--restore"],
+            vec!["--restore", "--save", "work"],
             vec!["--watch", "work"],
             vec![
                 "--watch",

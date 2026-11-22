@@ -8,6 +8,7 @@ mod model;
 mod pi;
 mod storage;
 mod store;
+mod tui;
 mod ui;
 mod watch;
 

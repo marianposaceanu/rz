@@ -58,6 +58,17 @@ impl Snapshot {
     pub fn sessions(&self) -> impl Iterator<Item = SessionRef<'_>> {
         self.terminals().filter_map(Terminal::session)
     }
+
+    pub fn agent_counts(&self) -> impl Iterator<Item = (Agent, usize)> + '_ {
+        Agent::ALL.into_iter().map(|agent| {
+            (
+                agent,
+                self.sessions()
+                    .filter(|session| session.agent == agent)
+                    .count(),
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

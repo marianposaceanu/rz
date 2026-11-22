@@ -19,6 +19,7 @@ use crate::{
     model::{Agent, SNAPSHOT_VERSION, Scope, Snapshot},
     pi, storage,
     store::{SnapshotEntry, SnapshotStore},
+    tui,
     ui::{self, display_time},
 };
 
@@ -67,6 +68,7 @@ impl App {
 
     pub fn run(&self, args: impl IntoIterator<Item = OsString>) -> Result<()> {
         match cli::parse(args)? {
+            Command::Ui => tui::run(self),
             Command::Save(options) => self.save(options),
             Command::Restore(options) => self.restore(options),
             Command::List(number) => self.list(number),
@@ -105,6 +107,11 @@ impl App {
     }
 
     pub(crate) fn save(&self, options: SaveOptions) -> Result<()> {
+        let entry = self.save_snapshot(options)?;
+        self.print_saved(&entry)
+    }
+
+    pub(crate) fn save_snapshot(&self, options: SaveOptions) -> Result<SnapshotEntry> {
         validate_name(&options.name)?;
         ghostty::ensure_running()?;
         let target_window_id = match (&options.window_id, options.current_window) {
@@ -123,14 +130,15 @@ impl App {
             .prefix(".rz-")
             .tempdir_in(&self.snapshots.root)?;
         fs::create_dir(staging.path().join("scrollback"))?;
-        self.capture_snapshot(
+        let snapshot = self.capture_snapshot(
             &options,
             target_window_id.as_deref(),
             &timestamp,
             &snapshot_id,
             staging.path(),
             &final_dir,
-        )
+        )?;
+        Ok(SnapshotEntry::saved(final_dir, snapshot))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -142,7 +150,7 @@ impl App {
         snapshot_id: &str,
         staging_dir: &Path,
         final_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<Snapshot> {
         let mut rows = ghostty::capture(
             &self.capture_script,
             options.capture_scrollback,
@@ -231,18 +239,24 @@ impl App {
         storage::write_json(&staging_dir.join("state.json"), &snapshot)?;
         fs::rename(staging_dir, final_dir)?;
 
+        Ok(snapshot)
+    }
+
+    fn print_saved(&self, entry: &SnapshotEntry) -> Result<()> {
+        let snapshot = entry.snapshot()?;
+        let final_dir = &entry.path;
         let mut lines = vec![
-            ui::labeled("SNAPSHOT", snapshot_id),
+            ui::labeled("SNAPSHOT", &snapshot.id),
             ui::labeled(
                 "SCOPE",
-                target_window_id.map_or_else(
-                    || "all Ghostty windows".into(),
-                    |id| format!("Ghostty window {id}"),
-                ),
+                match &snapshot.scope {
+                    Scope::Window { window_id } => format!("Ghostty window {window_id}"),
+                    Scope::AllWindows => "all Ghostty windows".into(),
+                },
             ),
-            ui::labeled("LAYOUT", layout_summary(&snapshot)),
+            ui::labeled("LAYOUT", layout_summary(snapshot)),
         ];
-        lines.extend(content_lines(&snapshot));
+        lines.extend(content_lines(snapshot));
         lines.push(ui::labeled(
             "SIZE",
             format!(
@@ -255,7 +269,7 @@ impl App {
             self.storage_summary(self.snapshots.entries()?.len())?,
         ));
         lines.push(String::new());
-        lines.extend(saved_tab_lines(&snapshot));
+        lines.extend(saved_tab_lines(snapshot));
         lines.push(String::new());
         lines.push(ui::labeled("LOCATION", final_dir.to_string_lossy()));
         lines.extend(
@@ -268,7 +282,7 @@ impl App {
         Ok(())
     }
 
-    fn restore(&self, options: RestoreOptions) -> Result<()> {
+    pub(crate) fn restore(&self, options: RestoreOptions) -> Result<()> {
         let entry = self.snapshots.resolve(options.selector.as_deref())?;
         let snapshot_dir = &entry.path;
         let snapshot = entry.snapshot()?;
@@ -698,19 +712,9 @@ fn counted(count: usize, noun: &str) -> String {
 }
 
 fn session_summary(snapshot: &Snapshot) -> String {
-    Agent::ALL
-        .into_iter()
-        .map(|agent| {
-            let count = snapshot
-                .terminals()
-                .filter(|terminal| {
-                    terminal
-                        .session()
-                        .is_some_and(|session| session.agent == agent)
-                })
-                .count();
-            format!("{} {count}", agent.label())
-        })
+    snapshot
+        .agent_counts()
+        .map(|(agent, count)| format!("{} {count}", agent.label()))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -754,7 +758,7 @@ fn content_lines(snapshot: &Snapshot) -> Vec<String> {
 
 fn human_duration(seconds: u64) -> String {
     for (unit, name) in [(86_400, "day"), (3_600, "hour"), (60, "minute")] {
-        if seconds >= unit && seconds % unit == 0 {
+        if seconds >= unit && seconds.is_multiple_of(unit) {
             let count = seconds / unit;
             return format!("{count} {name}{}", if count == 1 { "" } else { "s" });
         }

@@ -9,13 +9,16 @@ pub const MINIMUM_WATCH_INTERVAL: u64 = 10;
 #[command(name = "rz", version, about, no_binary_name = true)]
 #[command(group(ArgGroup::new("action").args([
     "save", "watch", "watch_status", "watch_stop", "clean", "list",
-    "install_pi_extension", "replay_scrollback", "watch_worker",
+    "install_pi_extension", "replay_scrollback", "watch_worker", "ui",
 ])))]
 #[command(group(ArgGroup::new("restore").args([
     "session", "keep_existing", "dry_run",
 ]).multiple(true).conflicts_with("action")))]
 #[command(group(ArgGroup::new("window_action").args(["save", "watch"])))]
 struct Cli {
+    /// Open the interactive workspace and storage manager
+    #[arg(long)]
+    ui: bool,
     /// Save a named Ghostty workspace
     #[arg(long, value_name = "NAME")]
     save: Option<String>,
@@ -31,7 +34,7 @@ struct Cli {
     #[arg(long, value_name = "NAME", requires = "every")]
     watch: Option<String>,
     /// Watch interval, such as 30s, 15m, or 1h
-    #[arg(long, requires = "watch", value_parser = parse_interval)]
+    #[arg(long, requires = "watch", value_name = "INTERVAL", value_parser = parse_interval)]
     every: Option<u64>,
     /// Watch all Ghostty windows
     #[arg(long, requires = "watch")]
@@ -43,7 +46,7 @@ struct Cli {
     #[arg(long)]
     watch_stop: bool,
     /// Remove snapshots older than AGE (default: 7d)
-    #[arg(long, num_args = 0..=1, default_missing_value = "7d", value_parser = parse_age)]
+    #[arg(long, num_args = 0..=1, value_name = "AGE", default_missing_value = "7d", value_parser = parse_age)]
     clean: Option<u64>,
     /// List snapshots, or inspect a number from the list
     #[arg(long, num_args = 0..=1, value_name = "NUMBER", value_parser = parse_number)]
@@ -68,6 +71,7 @@ struct Cli {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    Ui,
     Save(SaveOptions),
     Restore(RestoreOptions),
     List(Option<usize>),
@@ -134,7 +138,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(if let Some(name) = cli.save {
+    Ok(if cli.ui {
+        Command::Ui
+    } else if let Some(name) = cli.save {
         Command::Save(SaveOptions {
             name,
             capture_scrollback: !cli.no_scrollback,
@@ -223,7 +229,7 @@ fn parse_interval(value: &str) -> Result<u64> {
     parse_duration(value, MINIMUM_WATCH_INTERVAL)
 }
 
-fn parse_age(value: &str) -> Result<u64> {
+pub(crate) fn parse_age(value: &str) -> Result<u64> {
     parse_duration(value, 1)
 }
 
@@ -360,6 +366,7 @@ mod tests {
             vec!["--no-scrollback"],
             vec!["--every", "15m"],
             vec!["--current-window"],
+            vec!["--ui", "--session", "work"],
             vec!["--watch", "work"],
             vec![
                 "--watch",
